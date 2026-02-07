@@ -22,10 +22,7 @@ git clone https://github.com/trvon/vox && cd vox
 Or manually:
 
 ```bash
-cargo build --release
-cp target/release/vox ~/.local/bin/
-cp target/release/*.dylib ~/.local/bin/ 2>/dev/null  # macOS shared libs
-vox download-models
+cargo install --path .
 ```
 
 ## MCP Configuration
