@@ -141,7 +141,7 @@ pub fn start_capture() -> Result<(mpsc::Receiver<AudioChunk>, CaptureHandle)> {
         };
 
         let stop_inner = stop_clone.clone();
-        let mut accumulator: Vec<f32> = Vec::new();
+        let mut accumulator: Vec<f32> = Vec::with_capacity(VAD_WINDOW_SIZE * 4);
 
         let stream = match device.build_input_stream(
             &config,
@@ -208,11 +208,18 @@ pub fn start_capture() -> Result<(mpsc::Receiver<AudioChunk>, CaptureHandle)> {
     Ok((rx, handle))
 }
 
-/// Simple linear resampling
+/// Lanczos-3 windowed sinc resampler with precomputed kernel table.
+///
+/// Uses a 6-tap (a=3) Lanczos kernel which suppresses aliasing far better than
+/// linear interpolation, especially for the common 48kHz→16kHz (3:1) downsampling
+/// of microphone input fed to the STT engine. The kernel is precomputed into a
+/// 512-entry lookup table to avoid sin() calls in the real-time audio path.
 pub fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate {
         return samples.to_vec();
     }
+
+    const A: i32 = 3; // Lanczos kernel half-width
 
     let ratio = from_rate as f64 / to_rate as f64;
     let output_len = (samples.len() as f64 / ratio) as usize;
@@ -220,21 +227,75 @@ pub fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 
     for i in 0..output_len {
         let src_pos = i as f64 * ratio;
-        let src_idx = src_pos as usize;
-        let frac = src_pos - src_idx as f64;
+        let center = src_pos.floor() as i32;
+        let mut sum = 0.0_f64;
+        let mut weight_sum = 0.0_f64;
 
-        let sample = if src_idx + 1 < samples.len() {
-            samples[src_idx] as f64 * (1.0 - frac) + samples[src_idx + 1] as f64 * frac
-        } else if src_idx < samples.len() {
-            samples[src_idx] as f64
+        for j in (center - A + 1)..=(center + A) {
+            let x = src_pos - j as f64;
+            let w = lanczos3_table(x);
+            if j >= 0 && (j as usize) < samples.len() {
+                sum += samples[j as usize] as f64 * w;
+                weight_sum += w;
+            }
+        }
+
+        let sample = if weight_sum.abs() > 1e-10 {
+            sum / weight_sum
         } else {
             0.0
         };
-
         output.push(sample as f32);
     }
 
     output
+}
+
+// Precomputed Lanczos-3 kernel lookup table.
+// Covers [0, 3) with KERNEL_TABLE_SIZE entries. Symmetric, so we use abs(x).
+const KERNEL_TABLE_SIZE: usize = 512;
+const KERNEL_TABLE_SCALE: f64 = KERNEL_TABLE_SIZE as f64 / 3.0;
+
+/// Build the kernel table at compile time is not possible with sin(),
+/// so we use std::sync::LazyLock for one-time init.
+static KERNEL_TABLE: std::sync::LazyLock<[f32; KERNEL_TABLE_SIZE]> = std::sync::LazyLock::new(|| {
+    let mut table = [0.0f32; KERNEL_TABLE_SIZE];
+    for (i, entry) in table.iter_mut().enumerate() {
+        let x = i as f64 / KERNEL_TABLE_SCALE;
+        *entry = lanczos3_exact(x) as f32;
+    }
+    table
+});
+
+/// Fast kernel lookup with linear interpolation between table entries.
+#[inline]
+fn lanczos3_table(x: f64) -> f64 {
+    let ax = x.abs();
+    if ax >= 3.0 {
+        return 0.0;
+    }
+    let pos = ax * KERNEL_TABLE_SCALE;
+    let idx = pos as usize;
+    if idx + 1 >= KERNEL_TABLE_SIZE {
+        return KERNEL_TABLE[KERNEL_TABLE_SIZE - 1] as f64;
+    }
+    let frac = pos - idx as f64;
+    let a = KERNEL_TABLE[idx] as f64;
+    let b = KERNEL_TABLE[idx + 1] as f64;
+    a + (b - a) * frac
+}
+
+/// Exact Lanczos-3 kernel: sinc(x) * sinc(x/3) for |x| < 3, else 0.
+/// Used only to build the lookup table.
+fn lanczos3_exact(x: f64) -> f64 {
+    if x.abs() < 1e-10 {
+        return 1.0;
+    }
+    if x.abs() >= 3.0 {
+        return 0.0;
+    }
+    let px = std::f64::consts::PI * x;
+    (px.sin() / px) * ((px / 3.0).sin() / (px / 3.0))
 }
 
 #[cfg(test)]
@@ -262,8 +323,8 @@ mod tests {
         let input = vec![0.0, 1.0, 2.0, 3.0];
         let output = resample(&input, 8000, 16000);
         assert_eq!(output.len(), 8);
-        // First sample should be 0.0, last should approach 3.0
-        assert!((output[0] - 0.0).abs() < f32::EPSILON);
+        // First sample should be close to 0.0 (kernel edge effects allow small deviation)
+        assert!((output[0]).abs() < 0.05);
     }
 
     #[test]
@@ -287,5 +348,52 @@ mod tests {
         let output = resample(&input, 48000, 16000);
         // Should be approximately 16000 samples (1 second at 16kHz)
         assert_eq!(output.len(), 16000);
+    }
+
+    #[test]
+    fn lanczos3_kernel_properties() {
+        // Kernel is 1.0 at origin
+        assert!((lanczos3_exact(0.0) - 1.0).abs() < 1e-10);
+        // Kernel is 0 at integer multiples (except 0)
+        assert!(lanczos3_exact(1.0).abs() < 1e-10);
+        assert!(lanczos3_exact(2.0).abs() < 1e-10);
+        assert!(lanczos3_exact(-1.0).abs() < 1e-10);
+        assert!(lanczos3_exact(-2.0).abs() < 1e-10);
+        // Kernel is 0 outside [-3, 3]
+        assert_eq!(lanczos3_exact(3.0), 0.0);
+        assert_eq!(lanczos3_exact(-3.0), 0.0);
+        assert_eq!(lanczos3_exact(4.0), 0.0);
+        // Kernel is symmetric
+        assert!((lanczos3_exact(0.5) - lanczos3_exact(-0.5)).abs() < 1e-10);
+        assert!((lanczos3_exact(1.5) - lanczos3_exact(-1.5)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn lanczos3_table_matches_exact() {
+        // Verify table lookup is close to exact computation
+        for i in 0..100 {
+            let x = i as f64 * 0.03; // 0.0 to 2.97
+            let exact = lanczos3_exact(x);
+            let table = lanczos3_table(x);
+            assert!(
+                (exact - table).abs() < 0.005,
+                "Table mismatch at x={x}: exact={exact}, table={table}"
+            );
+        }
+    }
+
+    #[test]
+    fn sinc_resampler_preserves_dc_signal() {
+        // A constant signal should remain constant after resampling
+        let input: Vec<f32> = vec![0.75; 4800];
+        let output = resample(&input, 48000, 16000);
+        assert_eq!(output.len(), 1600);
+        // Interior samples (away from edges) should be very close to 0.75
+        for &s in &output[3..output.len() - 3] {
+            assert!(
+                (s - 0.75).abs() < 0.01,
+                "DC signal not preserved: got {s}, expected 0.75"
+            );
+        }
     }
 }

@@ -2,13 +2,13 @@
 
 ## Project Overview
 
-Vox is a lightweight voice MCP server (~1,200 lines of Rust) providing local text-to-speech (Kokoro) and speech-to-text (Whisper) via the MCP stdio transport. It runs as a subprocess per MCP client.
+Vox is a lightweight voice MCP server (~1,500 lines of Rust) providing local text-to-speech (Kokoro) and speech-to-text (Moonshine Base) via the MCP stdio transport. It runs as a subprocess per MCP client.
 
 ## Build & Test
 
 ```bash
 cargo check          # type-check only
-cargo test           # run all unit tests (47 tests across 6 modules)
+cargo test           # run all unit tests (84 tests across 10 modules)
 cargo clippy -- -D warnings  # lint — must pass with zero warnings
 ```
 
@@ -19,13 +19,16 @@ All three must pass cleanly before submitting changes.
 | Module | Purpose |
 |--------|---------|
 | `main.rs` | Entry point, config loading, model download, stdio/daemon startup |
+| `cli.rs` | Clap CLI parser: daemon, config, download-models subcommands |
 | `server.rs` | MCP tool handlers (`say`, `listen`, `converse`), streaming TTS pipeline |
 | `tts.rs` | Kokoro TTS engine wrapper, voice name → speaker ID resolution, sentence splitting |
-| `audio.rs` | cpal-based mic capture and speaker playback, linear resampling |
-| `stt.rs` | Whisper STT engine wrapper |
+| `audio.rs` | cpal-based mic capture and speaker playback, Lanczos-3 sinc resampling |
+| `stt.rs` | Moonshine Base STT engine wrapper |
 | `vad.rs` | Voice activity detection (silero) |
 | `config.rs` | TOML config loading, env var overrides (`VOX_*` prefix), path resolution |
+| `daemon.rs` | HTTP daemon lifecycle: daemonize, PID file, start/stop/status/log |
 | `models.rs` | Model readiness checks and download/extraction |
+| `lib.rs` | Public re-exports for benchmarks (`audio`, `config`, `error`, `tts`) |
 | `error.rs` | `VoiceError` enum with `thiserror` derives |
 
 ### Transport Modes
@@ -50,7 +53,7 @@ Multi-sentence text is pipelined: a producer task synthesizes sentences sequenti
 
 1. Compiled defaults (`Config::default()`)
 2. TOML file (`$XDG_CONFIG_HOME/vox/config.toml`)
-3. Environment variables (`VOX_SPEED`, `VOX_VOICE`, `VOX_WHISPER_MODEL`, `VOX_MODEL_DIR`, `VOX_LOG_LEVEL`)
+3. Environment variables (`VOX_SPEED`, `VOX_VOICE`, `VOX_MODEL_DIR`, `VOX_LOG_LEVEL`, `VOX_PORT`)
 
 ## Known Limitations
 

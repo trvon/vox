@@ -17,7 +17,7 @@ impl Default for Config {
         Self {
             model_dir: default_model_dir(),
             voice: "af_heart".to_string(),
-            speed: 1.0,
+            speed: 1.4,
             log_level: "info".to_string(),
         }
     }
@@ -179,7 +179,7 @@ mod tests {
     fn default_config_values() {
         let config = Config::default();
         assert_eq!(config.voice, "af_heart");
-        assert!((config.speed - 1.0).abs() < f32::EPSILON);
+        assert!((config.speed - 1.4).abs() < f32::EPSILON);
         assert_eq!(config.log_level, "info");
     }
 
@@ -233,7 +233,7 @@ mod tests {
     fn toml_deserialization_empty_uses_all_defaults() {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.voice, "af_heart");
-        assert!((config.speed - 1.0).abs() < f32::EPSILON);
+        assert!((config.speed - 1.4).abs() < f32::EPSILON);
     }
 
     #[test]
