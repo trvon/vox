@@ -84,3 +84,22 @@ jobs:
         with:
           tag_name: ${{ needs.release-please.outputs.tag_name }}
           files: ${{ matrix.name }}.tar.gz
+
+  npm-publish:
+    needs: [release-please, build]
+    if: needs.release-please.outputs.release_created
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Update package version
+        working-directory: npm
+        run: npm version "${{ needs.release-please.outputs.tag_name }}" --no-git-tag-version --allow-same-version
+      - name: Publish
+        working-directory: npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

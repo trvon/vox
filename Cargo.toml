@@ -26,6 +26,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["stream"] }
 dirs = "6"
+indicatif = "0.17"
+console = "0.15"
 hound = "3.5"
 tokio-stream = "0.1"
 futures = "0.3"
@@ -55,4 +57,8 @@ harness = false
 
 [[bench]]
 name = "audio_bench"
+harness = false
+
+[[bench]]
+name = "dsp_quality_bench"
 harness = false

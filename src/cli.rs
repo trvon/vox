@@ -22,6 +22,24 @@ pub enum Command {
     },
     /// Download models and exit
     DownloadModels,
+    /// Calibrate DSP parameters using a genetic algorithm on live audio
+    Calibrate {
+        /// Seconds of speech to record
+        #[arg(long, default_value = "10")]
+        speech_secs: u32,
+        /// Seconds of silence to record
+        #[arg(long, default_value = "5")]
+        silence_secs: u32,
+        /// GA population size
+        #[arg(long, default_value = "40")]
+        population: usize,
+        /// Number of GA generations
+        #[arg(long, default_value = "30")]
+        generations: usize,
+        /// Print results without saving to config
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -40,6 +58,8 @@ pub enum ConfigAction {
     },
     /// Show the config file path
     Path,
+    /// Reset DSP parameters to defaults
+    ResetDsp,
 }
 
 #[derive(Debug, Subcommand)]
@@ -195,6 +215,83 @@ mod tests {
             cli.command,
             Some(Command::Config {
                 action: ConfigAction::Path
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_calibrate_defaults() {
+        let cli = Cli::try_parse_from(["vox", "calibrate"]).unwrap();
+        match cli.command {
+            Some(Command::Calibrate {
+                speech_secs,
+                silence_secs,
+                population,
+                generations,
+                dry_run,
+            }) => {
+                assert_eq!(speech_secs, 10);
+                assert_eq!(silence_secs, 5);
+                assert_eq!(population, 40);
+                assert_eq!(generations, 30);
+                assert!(!dry_run);
+            }
+            other => panic!("Expected Calibrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_calibrate_custom_args() {
+        let cli = Cli::try_parse_from([
+            "vox",
+            "calibrate",
+            "--speech-secs",
+            "15",
+            "--silence-secs",
+            "8",
+            "--population",
+            "60",
+            "--generations",
+            "50",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Calibrate {
+                speech_secs,
+                silence_secs,
+                population,
+                generations,
+                dry_run,
+            }) => {
+                assert_eq!(speech_secs, 15);
+                assert_eq!(silence_secs, 8);
+                assert_eq!(population, 60);
+                assert_eq!(generations, 50);
+                assert!(dry_run);
+            }
+            other => panic!("Expected Calibrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_calibrate_dry_run_only() {
+        let cli = Cli::try_parse_from(["vox", "calibrate", "--dry-run"]).unwrap();
+        match cli.command {
+            Some(Command::Calibrate { dry_run, .. }) => {
+                assert!(dry_run);
+            }
+            other => panic!("Expected Calibrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_config_reset_dsp() {
+        let cli = Cli::try_parse_from(["vox", "config", "reset-dsp"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Config {
+                action: ConfigAction::ResetDsp
             })
         ));
     }

@@ -9,8 +9,23 @@ Local voice MCP server with text-to-speech (Kokoro) and speech-to-text (Moonshin
 | `say` | Speak text aloud through speakers |
 | `listen` | Record from microphone and transcribe |
 | `converse` | Speak then listen (bidirectional) |
+| `start_listening` | Start background mic capture with VAD+STT (queues to inbox) |
+| `check_inbox` | Drain transcribed messages from background listener |
+| `stop_listening` | Stop background listener, return remaining messages |
+| `calibrate` | Run DSP calibration via genetic algorithm on live audio |
+| `reset_dsp` | Reset DSP parameters to defaults |
 
 ## Install
+
+### npm (recommended)
+
+```bash
+npx vox-mcp
+# or
+npm install -g vox-mcp
+```
+
+### From source
 
 ```bash
 cargo install --path .
@@ -18,7 +33,20 @@ cargo install --path .
 
 ## MCP Configuration
 
-### Stdio mode (default)
+### npm (recommended)
+
+```json
+{
+  "mcpServers": {
+    "vox": {
+      "command": "npx",
+      "args": ["-y", "vox-mcp"]
+    }
+  }
+}
+```
+
+### Stdio mode (manual install)
 
 Each client spawns its own `vox` process. Simple, no setup.
 
@@ -80,6 +108,7 @@ vox config get            # show all values
 vox config get voice      # show a single value
 vox config set speed 1.5  # persist to config.toml
 vox config path           # print config file location
+vox config reset-dsp      # reset DSP parameters to defaults
 ```
 
 <details>
@@ -94,6 +123,28 @@ vox config path           # print config file location
 **British male** (`bm_*`): `bm_daniel`, `bm_fable`, `bm_george`, `bm_lewis`
 
 </details>
+
+## DSP Calibration
+
+The DSP parameters (high-pass filter cutoff, noise gate threshold, gate window size, normalization threshold) can be auto-tuned to your mic and room using a genetic algorithm:
+
+```bash
+vox calibrate              # record speech + silence, optimize, save to config
+vox calibrate --dry-run    # same but don't save (preview only)
+vox config reset-dsp       # revert DSP params to defaults if calibration went wrong
+```
+
+The calibrator records ~10s of speech and ~5s of silence, then runs a GA (40 population x 30 generations) to maximize SNR while preserving speech quality. Results are saved to `config.toml`.
+
+Calibration is also available as an MCP tool (`calibrate`), so an LLM can trigger it during a session. It defaults to `dry_run=true` for safety — set `dry_run=false` to persist results. Use `reset_dsp` to revert to defaults if calibration produces bad results.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--speech-secs` | `10` | Seconds of speech to record |
+| `--silence-secs` | `5` | Seconds of silence to record |
+| `--population` | `40` | GA population size |
+| `--generations` | `30` | Number of GA generations |
+| `--dry-run` | off | Print results without saving |
 
 ## Audio Pipeline
 

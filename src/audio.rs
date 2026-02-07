@@ -8,9 +8,6 @@ use std::sync::{
 use tokio::sync::mpsc;
 
 const TARGET_SAMPLE_RATE: u32 = 16000;
-const VAD_WINDOW_SIZE: usize = 512;
-/// RMS threshold below which a VAD window is zeroed to suppress echo/noise
-pub const NOISE_GATE_RMS: f32 = 0.01;
 
 /// Second-order Butterworth high-pass biquad filter.
 /// Removes low-frequency speaker bleed and room rumble from mic capture.
@@ -295,10 +292,27 @@ impl CaptureHandle {
     }
 }
 
+impl Drop for CaptureHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self._thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Record audio from the default input device.
-/// Returns a receiver of VAD-window-sized audio chunks (512 samples at 16kHz)
-/// and a Send-safe stop handle.
-pub fn start_capture() -> Result<(mpsc::Receiver<AudioChunk>, CaptureHandle)> {
+/// Returns a receiver of VAD-window-sized audio chunks at 16kHz and a Send-safe stop handle.
+///
+/// DSP parameters:
+/// - `hpf_cutoff_hz`: High-pass filter cutoff frequency (e.g. 200.0)
+/// - `noise_gate_rms`: RMS threshold below which windows are zeroed (e.g. 0.01)
+/// - `window_size`: Number of samples per VAD window (e.g. 512)
+pub fn start_capture(
+    hpf_cutoff_hz: f64,
+    noise_gate_rms: f32,
+    window_size: usize,
+) -> Result<(mpsc::Receiver<AudioChunk>, CaptureHandle)> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -332,9 +346,9 @@ pub fn start_capture() -> Result<(mpsc::Receiver<AudioChunk>, CaptureHandle)> {
         };
 
         let stop_inner = stop_clone.clone();
-        let mut accumulator: Vec<f32> = Vec::with_capacity(VAD_WINDOW_SIZE * 4);
-        let mut window_buf = vec![0.0f32; VAD_WINDOW_SIZE];
-        let mut hpf = BiquadHPF::highpass(200.0, device_sample_rate as f64);
+        let mut accumulator: Vec<f32> = Vec::with_capacity(window_size * 4);
+        let mut window_buf = vec![0.0f32; window_size];
+        let mut hpf = BiquadHPF::highpass(hpf_cutoff_hz, device_sample_rate as f64);
 
         let stream = match device.build_input_stream(
             &config,
@@ -352,7 +366,7 @@ pub fn start_capture() -> Result<(mpsc::Receiver<AudioChunk>, CaptureHandle)> {
                     data.to_vec()
                 };
 
-                // Apply 200Hz high-pass filter to remove speaker bleed & room rumble
+                // Apply high-pass filter to remove speaker bleed & room rumble
                 let filtered: Vec<f32> =
                     mono.iter().map(|&s| hpf.process(s as f64) as f32).collect();
 
@@ -366,13 +380,13 @@ pub fn start_capture() -> Result<(mpsc::Receiver<AudioChunk>, CaptureHandle)> {
                 accumulator.extend_from_slice(&resampled);
 
                 // Send complete VAD windows using pre-allocated buffer
-                while accumulator.len() >= VAD_WINDOW_SIZE {
-                    window_buf.copy_from_slice(&accumulator[..VAD_WINDOW_SIZE]);
-                    accumulator.drain(..VAD_WINDOW_SIZE);
+                while accumulator.len() >= window_size {
+                    window_buf.copy_from_slice(&accumulator[..window_size]);
+                    accumulator.drain(..window_size);
 
                     // RMS noise gate: zero out windows below threshold to prevent
                     // quiet echo/noise from triggering false VAD detections
-                    apply_noise_gate(&mut window_buf, NOISE_GATE_RMS);
+                    apply_noise_gate(&mut window_buf, noise_gate_rms);
 
                     let chunk = AudioChunk {
                         samples: window_buf.clone(),
@@ -686,16 +700,16 @@ mod tests {
 
     #[test]
     fn noise_gate_threshold_zeros_quiet_window() {
-        let mut window = vec![0.001f32; VAD_WINDOW_SIZE];
-        apply_noise_gate(&mut window, NOISE_GATE_RMS);
+        let mut window = vec![0.001f32; 512];
+        apply_noise_gate(&mut window, 0.01);
         assert!(window.iter().all(|&s| s == 0.0));
     }
 
     #[test]
     fn noise_gate_threshold_passes_loud_window() {
-        let mut window = vec![0.1f32; VAD_WINDOW_SIZE];
+        let mut window = vec![0.1f32; 512];
         let original = window.clone();
-        apply_noise_gate(&mut window, NOISE_GATE_RMS);
+        apply_noise_gate(&mut window, 0.01);
         // Should NOT zero the window
         assert_eq!(window, original);
     }

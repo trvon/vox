@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 mod audio;
+mod calibrate;
 mod cli;
 mod config;
 mod daemon;
@@ -86,12 +87,41 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
                 ConfigAction::Path => {
                     println!("{}", Config::config_path().display());
                 }
+                ConfigAction::ResetDsp => {
+                    Config::reset_dsp().map_err(|e| eyre::eyre!("{e}"))?;
+                    let defaults = config::DspConfig::default();
+                    eprintln!("DSP config reset to defaults:");
+                    eprintln!("  hpf_cutoff_hz:       {}", defaults.hpf_cutoff_hz);
+                    eprintln!("  noise_gate_rms:      {}", defaults.noise_gate_rms);
+                    eprintln!("  noise_gate_window:   {}", defaults.noise_gate_window);
+                    eprintln!("  normalize_threshold: {}", defaults.normalize_threshold);
+                    eprintln!("\nRestart daemon to apply.");
+                }
             }
         }
         Some(Command::DownloadModels) => {
             eprintln!("Downloading models...");
             models::download_models(&config).await?;
             eprintln!("All models downloaded successfully.");
+        }
+        Some(Command::Calibrate {
+            speech_secs,
+            silence_secs,
+            population,
+            generations,
+            dry_run,
+        }) => {
+            ensure_models(&config).await?;
+            audio::init();
+            calibrate::run_calibration(
+                &config,
+                speech_secs,
+                silence_secs,
+                population,
+                generations,
+                dry_run,
+            )
+            .await?;
         }
         Some(Command::Daemon { action }) => match action {
             DaemonAction::Start { port, .. } => {

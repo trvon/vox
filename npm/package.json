@@ -1,0 +1,23 @@
+{
+  "name": "vox-mcp",
+  "version": "0.1.0",
+  "description": "Local voice MCP server with text-to-speech and speech-to-text — no API keys, no cloud",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/trvon/vox"
+  },
+  "bin": {
+    "vox-mcp": "run.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "os": ["darwin", "linux"],
+  "cpu": ["x64", "arm64"],
+  "files": [
+    "install.js",
+    "run.js",
+    "README.md"
+  ]
+}

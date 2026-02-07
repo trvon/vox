@@ -111,7 +111,17 @@ impl TtsEngine {
 
         let sample_rate = unsafe { sherpa_rs_sys::SherpaOnnxOfflineTtsSampleRate(tts) } as u32;
 
-        tracing::info!(sample_rate, "TTS engine initialized");
+        // Warm up ONNX runtime so first user synthesis has no cold-start penalty
+        unsafe {
+            let warmup_text = cstring(".");
+            let warmup_ptr =
+                sherpa_rs_sys::SherpaOnnxOfflineTtsGenerate(tts, warmup_text.as_ptr(), 0, 1.0);
+            if !warmup_ptr.is_null() {
+                sherpa_rs_sys::SherpaOnnxDestroyOfflineTtsGeneratedAudio(warmup_ptr);
+            }
+        }
+
+        tracing::debug!(sample_rate, "TTS engine initialized");
 
         Ok(Self {
             tts,

@@ -57,13 +57,13 @@ fn bench_noise_gate(c: &mut Criterion) {
     group.bench_function("quiet_512", |b| {
         b.iter(|| {
             let mut s = quiet.clone();
-            vox::audio::apply_noise_gate(black_box(&mut s), vox::audio::NOISE_GATE_RMS);
+            vox::audio::apply_noise_gate(black_box(&mut s), 0.01);
         })
     });
     group.bench_function("loud_512", |b| {
         b.iter(|| {
             let mut s = loud.clone();
-            vox::audio::apply_noise_gate(black_box(&mut s), vox::audio::NOISE_GATE_RMS);
+            vox::audio::apply_noise_gate(black_box(&mut s), 0.01);
         })
     });
     group.finish();
