@@ -1,4 +1,4 @@
-use crate::config::{Config, WhisperModel};
+use crate::config::Config;
 use crate::error::{Result, VoiceError};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
@@ -6,25 +6,24 @@ use tokio::io::AsyncWriteExt;
 const VAD_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
 
-fn whisper_url(model: &WhisperModel) -> String {
-    format!(
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-{model}.tar.bz2"
-    )
-}
+const MOONSHINE_URL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-int8.tar.bz2";
 
 const KOKORO_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2";
 
 /// Check if all required models are present
 pub fn models_ready(config: &Config) -> bool {
-    let whisper_dir = config.whisper_dir();
+    let moonshine_dir = config.moonshine_dir();
     let kokoro_dir = config.kokoro_dir();
     let vad_path = config.vad_model_path();
 
     vad_path.exists()
-        && whisper_dir.join(format!("{}-encoder.onnx", config.whisper_model)).exists()
-        && whisper_dir.join(format!("{}-decoder.onnx", config.whisper_model)).exists()
-        && whisper_dir.join(format!("{}-tokens.txt", config.whisper_model)).exists()
+        && moonshine_dir.join("preprocess.onnx").exists()
+        && moonshine_dir.join("encode.int8.onnx").exists()
+        && moonshine_dir.join("uncached_decode.int8.onnx").exists()
+        && moonshine_dir.join("cached_decode.int8.onnx").exists()
+        && moonshine_dir.join("tokens.txt").exists()
         && kokoro_dir.join("model.onnx").exists()
         && kokoro_dir.join("voices.bin").exists()
         && kokoro_dir.join("tokens.txt").exists()
@@ -43,14 +42,12 @@ pub async fn download_models(config: &Config) -> Result<()> {
         eprintln!("  VAD model already exists, skipping");
     }
 
-    // Download Whisper model
-    let whisper_dir = config.whisper_dir();
-    let whisper_encoder = whisper_dir.join(format!("{}-encoder.onnx", config.whisper_model));
-    if !whisper_encoder.exists() {
-        let url = whisper_url(&config.whisper_model);
-        download_and_extract_tar_bz2(&url, &config.model_dir).await?;
+    // Download Moonshine model
+    let moonshine_dir = config.moonshine_dir();
+    if !moonshine_dir.join("preprocess.onnx").exists() {
+        download_and_extract_tar_bz2(MOONSHINE_URL, &config.model_dir).await?;
     } else {
-        eprintln!("  Whisper model already exists, skipping");
+        eprintln!("  Moonshine model already exists, skipping");
     }
 
     // Download Kokoro TTS model
@@ -179,4 +176,128 @@ fn extract_tar_bz2(data: &[u8], dest_dir: &Path) -> Result<()> {
 
     eprintln!("  Extraction complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn test_config(model_dir: &std::path::Path) -> Config {
+        Config {
+            model_dir: model_dir.to_path_buf(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn models_ready_false_on_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        assert!(!models_ready(&config));
+    }
+
+    #[test]
+    fn models_ready_true_when_all_files_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+
+        // Create VAD model
+        fs::write(config.vad_model_path(), b"dummy").unwrap();
+
+        // Create moonshine files
+        let moonshine_dir = config.moonshine_dir();
+        fs::create_dir_all(&moonshine_dir).unwrap();
+        fs::write(moonshine_dir.join("preprocess.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("encode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("uncached_decode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("cached_decode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("tokens.txt"), b"dummy").unwrap();
+
+        // Create kokoro files
+        let kokoro_dir = config.kokoro_dir();
+        fs::create_dir_all(&kokoro_dir).unwrap();
+        fs::write(kokoro_dir.join("model.onnx"), b"dummy").unwrap();
+        fs::write(kokoro_dir.join("voices.bin"), b"dummy").unwrap();
+        fs::write(kokoro_dir.join("tokens.txt"), b"dummy").unwrap();
+
+        assert!(models_ready(&config));
+    }
+
+    #[test]
+    fn models_ready_false_when_vad_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+
+        // Create everything except VAD
+        let moonshine_dir = config.moonshine_dir();
+        fs::create_dir_all(&moonshine_dir).unwrap();
+        fs::write(moonshine_dir.join("preprocess.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("encode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("uncached_decode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("cached_decode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("tokens.txt"), b"dummy").unwrap();
+
+        let kokoro_dir = config.kokoro_dir();
+        fs::create_dir_all(&kokoro_dir).unwrap();
+        fs::write(kokoro_dir.join("model.onnx"), b"dummy").unwrap();
+        fs::write(kokoro_dir.join("voices.bin"), b"dummy").unwrap();
+        fs::write(kokoro_dir.join("tokens.txt"), b"dummy").unwrap();
+
+        assert!(!models_ready(&config));
+    }
+
+    #[test]
+    fn models_ready_false_when_moonshine_encoder_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+
+        fs::write(config.vad_model_path(), b"dummy").unwrap();
+
+        let moonshine_dir = config.moonshine_dir();
+        fs::create_dir_all(&moonshine_dir).unwrap();
+        fs::write(moonshine_dir.join("preprocess.onnx"), b"dummy").unwrap();
+        // Missing encode.int8.onnx
+        fs::write(moonshine_dir.join("uncached_decode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("cached_decode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("tokens.txt"), b"dummy").unwrap();
+
+        let kokoro_dir = config.kokoro_dir();
+        fs::create_dir_all(&kokoro_dir).unwrap();
+        fs::write(kokoro_dir.join("model.onnx"), b"dummy").unwrap();
+        fs::write(kokoro_dir.join("voices.bin"), b"dummy").unwrap();
+        fs::write(kokoro_dir.join("tokens.txt"), b"dummy").unwrap();
+
+        assert!(!models_ready(&config));
+    }
+
+    #[test]
+    fn models_ready_false_when_kokoro_model_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+
+        fs::write(config.vad_model_path(), b"dummy").unwrap();
+
+        let moonshine_dir = config.moonshine_dir();
+        fs::create_dir_all(&moonshine_dir).unwrap();
+        fs::write(moonshine_dir.join("preprocess.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("encode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("uncached_decode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("cached_decode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("tokens.txt"), b"dummy").unwrap();
+
+        let kokoro_dir = config.kokoro_dir();
+        fs::create_dir_all(&kokoro_dir).unwrap();
+        // Missing model.onnx
+        fs::write(kokoro_dir.join("voices.bin"), b"dummy").unwrap();
+        fs::write(kokoro_dir.join("tokens.txt"), b"dummy").unwrap();
+
+        assert!(!models_ready(&config));
+    }
+
+    #[test]
+    fn moonshine_url_is_valid() {
+        assert!(MOONSHINE_URL.starts_with("https://"));
+        assert!(MOONSHINE_URL.contains("sherpa-onnx-moonshine-base-en-int8.tar.bz2"));
+    }
 }

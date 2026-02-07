@@ -1,37 +1,43 @@
 use crate::config::Config;
 use crate::error::{Result, VoiceError};
-use sherpa_rs::whisper::{WhisperConfig, WhisperRecognizer};
+use sherpa_rs::moonshine::{MoonshineConfig, MoonshineRecognizer};
 
 pub struct SttEngine {
-    recognizer: WhisperRecognizer,
+    recognizer: MoonshineRecognizer,
 }
 
 impl SttEngine {
     pub fn new(config: &Config) -> Result<Self> {
-        let whisper_dir = config.whisper_dir();
-        let model = &config.whisper_model;
+        let moonshine_dir = config.moonshine_dir();
 
-        let whisper_config = WhisperConfig {
-            encoder: whisper_dir
-                .join(format!("{model}-encoder.onnx"))
+        let moonshine_config = MoonshineConfig {
+            preprocessor: moonshine_dir
+                .join("preprocess.onnx")
                 .to_string_lossy()
                 .to_string(),
-            decoder: whisper_dir
-                .join(format!("{model}-decoder.onnx"))
+            encoder: moonshine_dir
+                .join("encode.int8.onnx")
                 .to_string_lossy()
                 .to_string(),
-            tokens: whisper_dir
-                .join(format!("{model}-tokens.txt"))
+            uncached_decoder: moonshine_dir
+                .join("uncached_decode.int8.onnx")
                 .to_string_lossy()
                 .to_string(),
-            language: "en".to_string(),
+            cached_decoder: moonshine_dir
+                .join("cached_decode.int8.onnx")
+                .to_string_lossy()
+                .to_string(),
+            tokens: moonshine_dir
+                .join("tokens.txt")
+                .to_string_lossy()
+                .to_string(),
             ..Default::default()
         };
 
-        let recognizer = WhisperRecognizer::new(whisper_config)
-            .map_err(|e| VoiceError::Stt(format!("Failed to initialize Whisper: {e}")))?;
+        let recognizer = MoonshineRecognizer::new(moonshine_config)
+            .map_err(|e| VoiceError::Stt(format!("Failed to initialize Moonshine: {e}")))?;
 
-        tracing::info!(model = %model, "STT engine initialized");
+        tracing::info!("STT engine initialized (Moonshine Base)");
 
         Ok(Self { recognizer })
     }
@@ -53,5 +59,28 @@ impl SttEngine {
     }
 }
 
-// WhisperRecognizer wraps a raw pointer but sherpa-rs declares Send+Sync
+// MoonshineRecognizer wraps a raw pointer but sherpa-rs declares Send+Sync
 unsafe impl Send for SttEngine {}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::Config;
+
+    #[test]
+    fn stt_config_paths_correct() {
+        let config = Config::default();
+        let moonshine_dir = config.moonshine_dir();
+
+        let preprocess = moonshine_dir.join("preprocess.onnx");
+        let encoder = moonshine_dir.join("encode.int8.onnx");
+        let uncached_decoder = moonshine_dir.join("uncached_decode.int8.onnx");
+        let cached_decoder = moonshine_dir.join("cached_decode.int8.onnx");
+        let tokens = moonshine_dir.join("tokens.txt");
+
+        assert!(preprocess.to_string_lossy().ends_with("preprocess.onnx"));
+        assert!(encoder.to_string_lossy().ends_with("encode.int8.onnx"));
+        assert!(uncached_decoder.to_string_lossy().ends_with("uncached_decode.int8.onnx"));
+        assert!(cached_decoder.to_string_lossy().ends_with("cached_decode.int8.onnx"));
+        assert!(tokens.to_string_lossy().ends_with("tokens.txt"));
+    }
+}
