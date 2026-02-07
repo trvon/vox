@@ -112,7 +112,8 @@ impl Config {
         let mut table = if path.exists() {
             let contents = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read config: {e}"))?;
-            contents.parse::<toml::Table>()
+            contents
+                .parse::<toml::Table>()
                 .map_err(|e| format!("Failed to parse config: {e}"))?
         } else {
             toml::Table::new()
@@ -120,14 +121,26 @@ impl Config {
 
         // Validate and insert
         match key {
-            "voice" => { table.insert(key.to_string(), toml::Value::String(value.to_string())); }
+            "voice" => {
+                table.insert(key.to_string(), toml::Value::String(value.to_string()));
+            }
             "speed" => {
-                let v: f32 = value.parse().map_err(|_| format!("Invalid speed: {value}"))?;
+                let v: f32 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid speed: {value}"))?;
                 table.insert(key.to_string(), toml::Value::Float(v as f64));
             }
-            "model_dir" => { table.insert(key.to_string(), toml::Value::String(value.to_string())); }
-            "log_level" => { table.insert(key.to_string(), toml::Value::String(value.to_string())); }
-            _ => return Err(format!("Unknown config key: {key}\nValid keys: voice, speed, model_dir, log_level")),
+            "model_dir" => {
+                table.insert(key.to_string(), toml::Value::String(value.to_string()));
+            }
+            "log_level" => {
+                table.insert(key.to_string(), toml::Value::String(value.to_string()));
+            }
+            _ => {
+                return Err(format!(
+                    "Unknown config key: {key}\nValid keys: voice, speed, model_dir, log_level"
+                ));
+            }
         }
 
         // Write back
@@ -137,8 +150,7 @@ impl Config {
         }
         let out = toml::to_string_pretty(&table)
             .map_err(|e| format!("Failed to serialize config: {e}"))?;
-        std::fs::write(&path, out)
-            .map_err(|e| format!("Failed to write config: {e}"))?;
+        std::fs::write(&path, out).map_err(|e| format!("Failed to write config: {e}"))?;
 
         Ok(())
     }
@@ -156,8 +168,7 @@ impl Config {
 
     /// Resolve path for the Moonshine model directory
     pub fn moonshine_dir(&self) -> PathBuf {
-        self.model_dir
-            .join("sherpa-onnx-moonshine-base-en-int8")
+        self.model_dir.join("sherpa-onnx-moonshine-base-en-int8")
     }
 
     /// Resolve path for the kokoro model directory

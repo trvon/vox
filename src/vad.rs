@@ -1,11 +1,11 @@
 use crate::config::Config;
 use crate::error::{Result, VoiceError};
-use sherpa_rs::silero_vad::{SileroVadConfig, SileroVad, SpeechSegment};
+use sherpa_rs::silero_vad::{SileroVad, SileroVadConfig, SpeechSegment};
 
 pub(crate) const VAD_SAMPLE_RATE: u32 = 16000;
 pub(crate) const VAD_WINDOW_SIZE: usize = 512;
 pub(crate) const VAD_THRESHOLD: f32 = 0.5;
-pub(crate) const VAD_MIN_SILENCE: f32 = 0.5;
+pub(crate) const VAD_MIN_SILENCE: f32 = 0.3;
 pub(crate) const VAD_MIN_SPEECH: f32 = 0.25;
 
 pub struct VadSession {
@@ -97,8 +97,8 @@ mod tests {
 
     #[test]
     fn vad_min_silence_allows_pauses() {
-        // 0.5s minimum silence prevents premature cutoff
-        assert!((VAD_MIN_SILENCE - 0.5).abs() < f32::EPSILON);
+        // 0.3s minimum silence prevents premature cutoff
+        assert!((VAD_MIN_SILENCE - 0.3).abs() < f32::EPSILON);
     }
 
     #[test]

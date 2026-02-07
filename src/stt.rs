@@ -79,8 +79,16 @@ mod tests {
 
         assert!(preprocess.to_string_lossy().ends_with("preprocess.onnx"));
         assert!(encoder.to_string_lossy().ends_with("encode.int8.onnx"));
-        assert!(uncached_decoder.to_string_lossy().ends_with("uncached_decode.int8.onnx"));
-        assert!(cached_decoder.to_string_lossy().ends_with("cached_decode.int8.onnx"));
+        assert!(
+            uncached_decoder
+                .to_string_lossy()
+                .ends_with("uncached_decode.int8.onnx")
+        );
+        assert!(
+            cached_decoder
+                .to_string_lossy()
+                .ends_with("cached_decode.int8.onnx")
+        );
         assert!(tokens.to_string_lossy().ends_with("tokens.txt"));
     }
 }

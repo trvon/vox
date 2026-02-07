@@ -2995,6 +2995,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sherpa-rs",
+ "sherpa-rs-sys",
  "tar",
  "tempfile",
  "thiserror 2.0.18",

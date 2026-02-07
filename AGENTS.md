@@ -2,17 +2,18 @@
 
 ## Project Overview
 
-Vox is a lightweight voice MCP server (~1,500 lines of Rust) providing local text-to-speech (Kokoro) and speech-to-text (Moonshine Base) via the MCP stdio transport. It runs as a subprocess per MCP client.
+Vox is a lightweight voice MCP server (~2,000 lines of Rust) providing local text-to-speech (Kokoro) and speech-to-text (Moonshine Base) via MCP. Supports both stdio transport (one process per client) and HTTP daemon mode (shared process, models loaded once).
 
 ## Build & Test
 
 ```bash
 cargo check          # type-check only
-cargo test           # run all unit tests (84 tests across 10 modules)
+cargo test           # run all unit tests (103 tests across 12 modules)
 cargo clippy -- -D warnings  # lint — must pass with zero warnings
+cargo bench                  # run Criterion benchmarks (DSP + TTS utilities)
 ```
 
-All three must pass cleanly before submitting changes.
+The first three must pass cleanly before submitting changes. See [BENCHMARKS.md](BENCHMARKS.md) for benchmark details.
 
 ## Architecture
 
@@ -21,8 +22,8 @@ All three must pass cleanly before submitting changes.
 | `main.rs` | Entry point, config loading, model download, stdio/daemon startup |
 | `cli.rs` | Clap CLI parser: daemon, config, download-models subcommands |
 | `server.rs` | MCP tool handlers (`say`, `listen`, `converse`), streaming TTS pipeline |
-| `tts.rs` | Kokoro TTS engine wrapper, voice name → speaker ID resolution, sentence splitting |
-| `audio.rs` | cpal-based mic capture and speaker playback, Lanczos-3 sinc resampling |
+| `tts.rs` | Kokoro TTS via direct `sherpa-rs-sys` FFI, streaming callback, voice resolution, sentence splitting |
+| `audio.rs` | cpal capture/playback (batch + streaming ring buffer), Lanczos-3 resampling, DSP (HPF, noise gate, normalize) |
 | `stt.rs` | Moonshine Base STT engine wrapper |
 | `vad.rs` | Voice activity detection (silero) |
 | `config.rs` | TOML config loading, env var overrides (`VOX_*` prefix), path resolution |
@@ -38,7 +39,9 @@ All three must pass cleanly before submitting changes.
 
 ### Streaming TTS
 
-Multi-sentence text is pipelined: a producer task synthesizes sentences sequentially and sends audio chunks through a channel, while a consumer task plays them back. This means the first sentence starts playing as soon as it's synthesized, while remaining sentences are synthesized in parallel with playback. Single-sentence text takes the simple path with no channel overhead.
+Uses `SherpaOnnxOfflineTtsGenerateWithCallbackWithArg` from `sherpa-rs-sys` (direct FFI, bypassing the `sherpa-rs` KokoroTts wrapper). A C callback fires with audio chunks during synthesis, copies them into a `Vec<f32>`, and sends them through a `std::sync::mpsc` channel. A consumer task plays chunks through a cpal output stream backed by an `Arc<Mutex<VecDeque<f32>>>` ring buffer. Audio starts playing within the first callback — no waiting for full synthesis to complete.
+
+**Callback convention**: sherpa-onnx returns `1 = continue, 0 = stop` (opposite of typical C 0=success).
 
 ## Code Conventions
 

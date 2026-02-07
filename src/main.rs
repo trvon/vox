@@ -1,3 +1,6 @@
+// Items pub in lib.rs for benchmarks/tests may not be used in the binary
+#![allow(dead_code)]
+
 mod audio;
 mod cli;
 mod config;
@@ -21,8 +24,7 @@ fn main() -> eyre::Result<()> {
     // Daemonize by re-exec with --foreground (parent returns immediately)
     if let Some(Command::Daemon {
         action:
-            DaemonAction::Start { foreground, port }
-            | DaemonAction::Restart { foreground, port },
+            DaemonAction::Start { foreground, port } | DaemonAction::Restart { foreground, port },
     }) = &cli.command
         && !foreground
     {
@@ -61,15 +63,15 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
     match cli.command {
         Some(Command::Config { action }) => {
             match action {
-                ConfigAction::Get { key: Some(key) } => {
-                    match config.get_value(&key) {
-                        Some(val) => println!("{val}"),
-                        None => {
-                            eprintln!("Unknown key: {key}\nValid keys: voice, speed, model_dir, log_level");
-                            std::process::exit(1);
-                        }
+                ConfigAction::Get { key: Some(key) } => match config.get_value(&key) {
+                    Some(val) => println!("{val}"),
+                    None => {
+                        eprintln!(
+                            "Unknown key: {key}\nValid keys: voice, speed, model_dir, log_level"
+                        );
+                        std::process::exit(1);
                     }
-                }
+                },
                 ConfigAction::Get { key: None } => {
                     println!("{}", config.display_all());
                 }
@@ -146,19 +148,31 @@ async fn ensure_models(config: &Config) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Initialize TTS and STT engines (blocking work on spawn_blocking).
+/// Initialize TTS and STT engines in parallel (blocking work on spawn_blocking).
 async fn init_engines(config: &Config) -> eyre::Result<(tts::TtsEngine, stt::SttEngine)> {
     eprintln!("Initializing voice engines...");
 
-    let tts_engine = {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || tts::TtsEngine::new(&config)).await??
-    };
+    let c1 = config.clone();
+    let c2 = config.clone();
 
-    let stt_engine = {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || stt::SttEngine::new(&config)).await??
-    };
+    let (tts_result, stt_result) = tokio::try_join!(
+        async {
+            tokio::task::spawn_blocking(move || tts::TtsEngine::new(&c1))
+                .await
+                .map_err(|e| eyre::eyre!(e))
+        },
+        async {
+            tokio::task::spawn_blocking(move || stt::SttEngine::new(&c2))
+                .await
+                .map_err(|e| eyre::eyre!(e))
+        },
+    )?;
+
+    let tts_engine = tts_result?;
+    let stt_engine = stt_result?;
+
+    // Eagerly initialize the resampler kernel table
+    audio::init();
 
     Ok((tts_engine, stt_engine))
 }

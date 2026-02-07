@@ -85,7 +85,9 @@ mod tests {
     fn parse_daemon_start() {
         let cli = Cli::try_parse_from(["vox", "daemon", "start", "-p", "8080"]).unwrap();
         match cli.command {
-            Some(Command::Daemon { action: DaemonAction::Start { port, foreground } }) => {
+            Some(Command::Daemon {
+                action: DaemonAction::Start { port, foreground },
+            }) => {
                 assert_eq!(port, Some(8080));
                 assert!(!foreground);
             }
@@ -97,7 +99,9 @@ mod tests {
     fn parse_daemon_start_foreground() {
         let cli = Cli::try_parse_from(["vox", "daemon", "start", "--foreground"]).unwrap();
         match cli.command {
-            Some(Command::Daemon { action: DaemonAction::Start { port, foreground } }) => {
+            Some(Command::Daemon {
+                action: DaemonAction::Start { port, foreground },
+            }) => {
                 assert!(port.is_none());
                 assert!(foreground);
             }
@@ -115,7 +119,9 @@ mod tests {
     fn parse_daemon_stop() {
         let cli = Cli::try_parse_from(["vox", "daemon", "stop"]).unwrap();
         match cli.command {
-            Some(Command::Daemon { action: DaemonAction::Stop }) => {}
+            Some(Command::Daemon {
+                action: DaemonAction::Stop,
+            }) => {}
             other => panic!("Expected Daemon Stop, got {other:?}"),
         }
     }
@@ -124,7 +130,9 @@ mod tests {
     fn parse_daemon_status() {
         let cli = Cli::try_parse_from(["vox", "daemon", "status"]).unwrap();
         match cli.command {
-            Some(Command::Daemon { action: DaemonAction::Status }) => {}
+            Some(Command::Daemon {
+                action: DaemonAction::Status,
+            }) => {}
             other => panic!("Expected Daemon Status, got {other:?}"),
         }
     }
@@ -133,7 +141,9 @@ mod tests {
     fn parse_daemon_log() {
         let cli = Cli::try_parse_from(["vox", "daemon", "log"]).unwrap();
         match cli.command {
-            Some(Command::Daemon { action: DaemonAction::Log }) => {}
+            Some(Command::Daemon {
+                action: DaemonAction::Log,
+            }) => {}
             other => panic!("Expected Daemon Log, got {other:?}"),
         }
     }
@@ -142,7 +152,9 @@ mod tests {
     fn parse_config_get_all() {
         let cli = Cli::try_parse_from(["vox", "config", "get"]).unwrap();
         match cli.command {
-            Some(Command::Config { action: ConfigAction::Get { key } }) => {
+            Some(Command::Config {
+                action: ConfigAction::Get { key },
+            }) => {
                 assert!(key.is_none());
             }
             other => panic!("Expected Config Get, got {other:?}"),
@@ -153,7 +165,9 @@ mod tests {
     fn parse_config_get_key() {
         let cli = Cli::try_parse_from(["vox", "config", "get", "voice"]).unwrap();
         match cli.command {
-            Some(Command::Config { action: ConfigAction::Get { key } }) => {
+            Some(Command::Config {
+                action: ConfigAction::Get { key },
+            }) => {
                 assert_eq!(key.as_deref(), Some("voice"));
             }
             other => panic!("Expected Config Get, got {other:?}"),
@@ -164,7 +178,9 @@ mod tests {
     fn parse_config_set() {
         let cli = Cli::try_parse_from(["vox", "config", "set", "speed", "1.3"]).unwrap();
         match cli.command {
-            Some(Command::Config { action: ConfigAction::Set { key, value } }) => {
+            Some(Command::Config {
+                action: ConfigAction::Set { key, value },
+            }) => {
                 assert_eq!(key, "speed");
                 assert_eq!(value, "1.3");
             }
@@ -177,7 +193,9 @@ mod tests {
         let cli = Cli::try_parse_from(["vox", "config", "path"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Config { action: ConfigAction::Path })
+            Some(Command::Config {
+                action: ConfigAction::Path
+            })
         ));
     }
 

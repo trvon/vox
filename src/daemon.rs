@@ -134,23 +134,14 @@ pub fn log_file_path() -> PathBuf {
 /// Resolve port from CLI arg > VOX_PORT env > default 3030.
 pub fn resolve_port(cli_port: Option<u16>) -> u16 {
     cli_port
-        .or_else(|| {
-            std::env::var("VOX_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-        })
+        .or_else(|| std::env::var("VOX_PORT").ok().and_then(|p| p.parse().ok()))
         .unwrap_or(DEFAULT_PORT)
 }
 
 /// Start the HTTP daemon.
-pub async fn start(
-    tts: TtsEngine,
-    stt: SttEngine,
-    config: Config,
-    port: u16,
-) -> eyre::Result<()> {
+pub async fn start(tts: TtsEngine, stt: SttEngine, config: Config, port: u16) -> eyre::Result<()> {
     use rmcp::transport::streamable_http_server::{
-        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
 
     let tts = Arc::new(Mutex::new(tts));
@@ -213,9 +204,9 @@ pub async fn start(
 /// Stop a running daemon by sending SIGTERM.
 pub fn stop_daemon() -> eyre::Result<()> {
     let path = pid_file_path();
-    let contents = fs::read_to_string(&path).map_err(|_| eyre::eyre!("No PID file found — daemon is not running"))?;
-    let state = DaemonState::parse(&contents)
-        .ok_or_else(|| eyre::eyre!("Corrupt PID file"))?;
+    let contents = fs::read_to_string(&path)
+        .map_err(|_| eyre::eyre!("No PID file found — daemon is not running"))?;
+    let state = DaemonState::parse(&contents).ok_or_else(|| eyre::eyre!("Corrupt PID file"))?;
 
     if !state.is_running() {
         remove_pid_file();
@@ -265,7 +256,10 @@ pub fn daemon_log() -> eyre::Result<()> {
 pub fn daemon_status() -> i32 {
     match read_state() {
         Some(state) => {
-            eprintln!("Vox daemon is running (pid {}, port {})", state.pid, state.port);
+            eprintln!(
+                "Vox daemon is running (pid {}, port {})",
+                state.pid, state.port
+            );
             0
         }
         None => {
