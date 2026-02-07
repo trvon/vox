@@ -252,13 +252,13 @@ impl Config {
         }
         let contents =
             std::fs::read_to_string(&path).map_err(|e| format!("Failed to read config: {e}"))?;
-        let mut table: toml::Table =
-            contents.parse().map_err(|e| format!("Failed to parse config: {e}"))?;
+        let mut table: toml::Table = contents
+            .parse()
+            .map_err(|e| format!("Failed to parse config: {e}"))?;
         table.remove("dsp");
         let new_contents = toml::to_string_pretty(&table)
             .map_err(|e| format!("Failed to serialize config: {e}"))?;
-        std::fs::write(&path, new_contents)
-            .map_err(|e| format!("Failed to write config: {e}"))?;
+        std::fs::write(&path, new_contents).map_err(|e| format!("Failed to write config: {e}"))?;
         Ok(())
     }
 
@@ -418,10 +418,7 @@ mod tests {
         assert_eq!(config.get_value("dsp.hpf_cutoff_hz").unwrap(), "200");
         assert_eq!(config.get_value("dsp.noise_gate_rms").unwrap(), "0.01");
         assert_eq!(config.get_value("dsp.noise_gate_window").unwrap(), "512");
-        assert_eq!(
-            config.get_value("dsp.normalize_threshold").unwrap(),
-            "0.5"
-        );
+        assert_eq!(config.get_value("dsp.normalize_threshold").unwrap(), "0.5");
     }
 
     #[test]

@@ -135,10 +135,7 @@ fn set_value_dsp_keys_via_toml_manipulation() {
     dsp.insert("hpf_cutoff_hz".to_string(), toml::Value::Float(300.0));
     dsp.insert("noise_gate_rms".to_string(), toml::Value::Float(0.02));
     dsp.insert("noise_gate_window".to_string(), toml::Value::Integer(256));
-    dsp.insert(
-        "normalize_threshold".to_string(),
-        toml::Value::Float(0.8),
-    );
+    dsp.insert("normalize_threshold".to_string(), toml::Value::Float(0.8));
 
     let toml_str = toml::to_string_pretty(&table).unwrap();
     let config: Config = toml::from_str(&toml_str).unwrap();

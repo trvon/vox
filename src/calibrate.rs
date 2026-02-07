@@ -1,6 +1,6 @@
 use crate::audio;
 use crate::config::{Config, DspConfig};
-use crate::vad::{VadSession, VAD_WINDOW_SIZE};
+use crate::vad::{VAD_WINDOW_SIZE, VadSession};
 
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -131,11 +131,7 @@ fn nearest_power_of_two(n: usize) -> usize {
     }
     let lower = 1usize << (usize::BITS - 1 - n.leading_zeros());
     let upper = lower << 1;
-    if n - lower < upper - n {
-        lower
-    } else {
-        upper
-    }
+    if n - lower < upper - n { lower } else { upper }
 }
 
 // --- GA operators ---
@@ -233,7 +229,12 @@ fn rms(samples: &[f32]) -> f64 {
     if samples.is_empty() {
         return 0.0;
     }
-    (samples.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / samples.len() as f64).sqrt()
+    (samples
+        .iter()
+        .map(|s| (*s as f64) * (*s as f64))
+        .sum::<f64>()
+        / samples.len() as f64)
+        .sqrt()
 }
 
 /// Apply the DSP chain to a buffer in-place.
@@ -452,8 +453,9 @@ fn run_ga(
 
         // Adaptive mutation: ramp up during stagnation, decay when improving
         mutation_prob = if stagnation > 0 {
-            (base_mutation_prob + (max_mutation_prob - base_mutation_prob)
-                * stagnation as f64 / stagnation_limit as f64)
+            (base_mutation_prob
+                + (max_mutation_prob - base_mutation_prob) * stagnation as f64
+                    / stagnation_limit as f64)
                 .min(max_mutation_prob)
         } else {
             base_mutation_prob
@@ -461,7 +463,10 @@ fn run_ga(
 
         if let Some(pb) = progress {
             pb.set_position((generation + 1) as u64);
-            pb.set_message(format!("best: {:+.2} vs baseline", current_best - baseline_fitness));
+            pb.set_message(format!(
+                "best: {:+.2} vs baseline",
+                current_best - baseline_fitness
+            ));
         }
 
         if stagnation >= stagnation_limit {
@@ -567,8 +572,8 @@ pub struct CalibrationResult {
 /// This dramatically improves the speech/silence RMS ratio in noisy environments.
 fn vad_filter_speech(config: &Config, raw: &[f32]) -> eyre::Result<Vec<f32>> {
     let duration_secs = raw.len() as f32 / SAMPLE_RATE as f32;
-    let mut vad = VadSession::new(config, duration_secs)
-        .map_err(|e| eyre::eyre!("VAD init failed: {e}"))?;
+    let mut vad =
+        VadSession::new(config, duration_secs).map_err(|e| eyre::eyre!("VAD init failed: {e}"))?;
 
     for chunk in raw.chunks(VAD_WINDOW_SIZE) {
         if chunk.len() == VAD_WINDOW_SIZE {
@@ -678,7 +683,10 @@ pub async fn run_calibration(
         } else if ratio < 5.0 {
             term.write_line(&format!(
                 "    {}",
-                style(format!("Warning: low SNR ({ratio:.1}x). Results may be suboptimal.")).yellow()
+                style(format!(
+                    "Warning: low SNR ({ratio:.1}x). Results may be suboptimal."
+                ))
+                .yellow()
             ))?;
         }
     }
@@ -688,18 +696,13 @@ pub async fn run_calibration(
     let baseline_fitness = evaluate(&baseline, &speech_samples, &silence_samples);
 
     // --- GA phase ---
-    term.write_line(&format!(
-        "  {} Optimizing...",
-        style("\u{25b8}").bold()
-    ))?;
+    term.write_line(&format!("  {} Optimizing...", style("\u{25b8}").bold()))?;
 
     let pb_ga = ProgressBar::new(generations as u64);
     pb_ga.set_style(
-        ProgressStyle::with_template(
-            "  {bar:38.cyan/dim} {pos}/{len} generations    {msg}",
-        )
-        .unwrap()
-        .progress_chars("\u{2588}\u{2588}\u{2500}"),
+        ProgressStyle::with_template("  {bar:38.cyan/dim} {pos}/{len} generations    {msg}")
+            .unwrap()
+            .progress_chars("\u{2588}\u{2588}\u{2500}"),
     );
 
     let mut rng = Lcg::from_time();
@@ -714,7 +717,10 @@ pub async fn run_calibration(
         baseline_fitness,
     );
 
-    pb_ga.finish_with_message(format!("best: {:+.2} vs baseline", best.fitness - baseline_fitness));
+    pb_ga.finish_with_message(format!(
+        "best: {:+.2} vs baseline",
+        best.fitness - baseline_fitness
+    ));
     term.write_line("")?;
 
     // GA guarantees best.fitness >= baseline_fitness, but belt-and-suspenders
@@ -831,11 +837,9 @@ pub async fn run_calibration(
 fn make_timer_bar(total_secs: u64) -> ProgressBar {
     let pb = ProgressBar::new(total_secs);
     pb.set_style(
-        ProgressStyle::with_template(
-            "  {bar:38.cyan/dim} {msg}",
-        )
-        .unwrap()
-        .progress_chars("\u{2588}\u{2588}\u{2500}"),
+        ProgressStyle::with_template("  {bar:38.cyan/dim} {msg}")
+            .unwrap()
+            .progress_chars("\u{2588}\u{2588}\u{2500}"),
     );
     pb.set_message(format!("{total_secs}s left    0 samples"));
     pb
@@ -923,18 +927,15 @@ mod tests {
                     sample += amp * (2.0 * std::f64::consts::PI * 150.0 * h as f64 * t).sin();
                 }
                 // Formant-like resonances at F1≈500Hz and F2≈1500Hz
-                sample +=
-                    0.3 * (2.0 * std::f64::consts::PI * 500.0 * t).sin();
-                sample +=
-                    0.2 * (2.0 * std::f64::consts::PI * 1500.0 * t).sin();
+                sample += 0.3 * (2.0 * std::f64::consts::PI * 500.0 * t).sin();
+                sample += 0.2 * (2.0 * std::f64::consts::PI * 1500.0 * t).sin();
                 // Sibilant energy (high-freq noise burst every ~0.5s)
                 let in_sibilant = ((t * 2.0) % 1.0) > 0.8;
                 if in_sibilant {
                     noise_state = noise_state
                         .wrapping_mul(6364136223846793005)
                         .wrapping_add(1442695040888963407);
-                    let noise_val =
-                        ((noise_state >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0;
+                    let noise_val = ((noise_state >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0;
                     sample += 0.15 * noise_val;
                 }
                 (sample * 0.3) as f32 // scale to reasonable amplitude
@@ -1090,7 +1091,10 @@ mod tests {
     fn test_spectral_distortion_identical_is_zero() {
         let signal = speech_signal(16000);
         let d = spectral_distortion(&signal, &signal);
-        assert!(d < 0.001, "Identical signals should have ~0 distortion, got {d}");
+        assert!(
+            d < 0.001,
+            "Identical signals should have ~0 distortion, got {d}"
+        );
     }
 
     #[test]
@@ -1115,7 +1119,10 @@ mod tests {
             fitness: f64::NEG_INFINITY,
         };
         let f = evaluate(&g, &speech, &silence);
-        assert!(f == f64::NEG_INFINITY, "Zero speech should get -inf fitness");
+        assert!(
+            f == f64::NEG_INFINITY,
+            "Zero speech should get -inf fitness"
+        );
     }
 
     #[test]
@@ -1222,7 +1229,16 @@ mod tests {
         let default_config = DspConfig::default();
         let default_genome = Genome::from_dsp_config(&default_config);
         let default_fitness = evaluate(&default_genome, &speech, &silence);
-        let best = run_ga(&speech, &silence, &default_config, 40, 30, &mut rng, None, default_fitness);
+        let best = run_ga(
+            &speech,
+            &silence,
+            &default_config,
+            40,
+            30,
+            &mut rng,
+            None,
+            default_fitness,
+        );
 
         assert!(best.fitness.is_finite(), "Best fitness should be finite");
         assert!(
@@ -1243,7 +1259,16 @@ mod tests {
         let default_config = DspConfig::default();
         let default_genome = Genome::from_dsp_config(&default_config);
         let default_fitness = evaluate(&default_genome, &speech, &silence);
-        let best = run_ga(&speech, &silence, &default_config, 30, 20, &mut rng, None, default_fitness);
+        let best = run_ga(
+            &speech,
+            &silence,
+            &default_config,
+            30,
+            20,
+            &mut rng,
+            None,
+            default_fitness,
+        );
 
         assert!(best.fitness.is_finite(), "Best fitness should be finite");
         assert!(
@@ -1266,7 +1291,16 @@ mod tests {
         let default_config = DspConfig::default();
         let default_genome = Genome::from_dsp_config(&default_config);
         let default_fitness = evaluate(&default_genome, &speech, &silence);
-        let best = run_ga(&speech, &silence, &default_config, 6, 15, &mut rng, None, default_fitness);
+        let best = run_ga(
+            &speech,
+            &silence,
+            &default_config,
+            6,
+            15,
+            &mut rng,
+            None,
+            default_fitness,
+        );
 
         assert!(best.fitness.is_finite() || best.fitness == f64::NEG_INFINITY);
         let dsp = best.to_dsp_config();
@@ -1286,7 +1320,16 @@ mod tests {
         // Run multiple times with different seeds to stress-test the guarantee
         for seed in [1, 42, 99, 1337, 9999] {
             let mut rng = Lcg::new(seed);
-            let best = run_ga(&speech, &silence, &default_config, 10, 5, &mut rng, None, baseline);
+            let best = run_ga(
+                &speech,
+                &silence,
+                &default_config,
+                10,
+                5,
+                &mut rng,
+                None,
+                baseline,
+            );
             assert!(
                 best.fitness >= baseline,
                 "seed={seed}: GA regressed ({:.4}) below baseline ({:.4})",

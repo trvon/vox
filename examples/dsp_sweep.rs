@@ -60,8 +60,7 @@ fn mix_snr(signal: &[f32], noise: &[f32], snr_db: f32) -> Vec<f32> {
 /// SNR in dB: compare processed signal against clean reference
 fn snr_db(processed: &[f32], reference: &[f32]) -> f32 {
     let len = processed.len().min(reference.len());
-    let signal_power: f32 =
-        reference[..len].iter().map(|s| s * s).sum::<f32>() / len as f32;
+    let signal_power: f32 = reference[..len].iter().map(|s| s * s).sum::<f32>() / len as f32;
     let noise_power: f32 = processed[..len]
         .iter()
         .zip(reference[..len].iter())
@@ -171,7 +170,9 @@ fn main() {
     let norm_thresholds = [0.1f32, 0.2, 0.3, 0.5, 0.7, 1.0];
 
     // CSV header
-    println!("hpf_cutoff,noise_gate_rms,normalize_threshold,snr_improvement_db,noise_floor_db,speech_retention,rejection_ratio");
+    println!(
+        "hpf_cutoff,noise_gate_rms,normalize_threshold,snr_improvement_db,noise_floor_db,speech_retention,rejection_ratio"
+    );
 
     let mut results: Vec<SweepResult> = Vec::new();
 
@@ -224,7 +225,13 @@ fn main() {
     eprintln!("\n=== Top 5 Parameter Combinations ===");
     eprintln!(
         "{:<12} {:<16} {:<20} {:<18} {:<14} {:<16} {:<14}",
-        "HPF (Hz)", "Gate RMS", "Norm Threshold", "SNR Improv (dB)", "Noise (dB)", "Retention", "Rejection"
+        "HPF (Hz)",
+        "Gate RMS",
+        "Norm Threshold",
+        "SNR Improv (dB)",
+        "Noise (dB)",
+        "Retention",
+        "Rejection"
     );
     eprintln!("{}", "-".repeat(110));
     for r in results.iter().take(5) {

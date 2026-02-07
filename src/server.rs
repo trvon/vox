@@ -236,9 +236,7 @@ impl VoiceMcpServer {
         min_speech_ms: Option<u32>,
     ) -> std::result::Result<String, String> {
         if self.bg_active.load(Ordering::Relaxed) {
-            return Err(
-                "Background listener is active. Call stop_listening first.".to_string(),
-            );
+            return Err("Background listener is active. Call stop_listening first.".to_string());
         }
         let config = self.config.clone();
         let max_speech_secs = timeout_secs as f32;
@@ -373,7 +371,11 @@ impl VoiceMcpServer {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         let text = self
-            .record_and_transcribe(params.timeout_secs, params.silence_timeout_ms, params.min_speech_ms)
+            .record_and_transcribe(
+                params.timeout_secs,
+                params.silence_timeout_ms,
+                params.min_speech_ms,
+            )
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
 
@@ -410,7 +412,11 @@ impl VoiceMcpServer {
         Parameters(params): Parameters<ListenParams>,
     ) -> Result<CallToolResult, McpError> {
         let text = self
-            .record_and_transcribe(params.timeout_secs, params.silence_timeout_ms, params.min_speech_ms)
+            .record_and_transcribe(
+                params.timeout_secs,
+                params.silence_timeout_ms,
+                params.min_speech_ms,
+            )
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
 
@@ -518,9 +524,7 @@ impl VoiceMcpServer {
                                 };
                                 match stt.transcribe(16000, &samples) {
                                     Ok(text) => {
-                                        if !text.is_empty()
-                                            && text != "(no speech detected)"
-                                        {
+                                        if !text.is_empty() && text != "(no speech detected)" {
                                             let msg = InboxMessage {
                                                 text,
                                                 timestamp: chrono_now(),
@@ -563,8 +567,7 @@ impl VoiceMcpServer {
             inbox.drain(..).collect()
         };
 
-        let json = serde_json::to_string_pretty(&messages)
-            .unwrap_or_else(|_| "[]".to_string());
+        let json = serde_json::to_string_pretty(&messages).unwrap_or_else(|_| "[]".to_string());
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -602,8 +605,7 @@ impl VoiceMcpServer {
             inbox.drain(..).collect()
         };
 
-        let json = serde_json::to_string_pretty(&messages)
-            .unwrap_or_else(|_| "[]".to_string());
+        let json = serde_json::to_string_pretty(&messages).unwrap_or_else(|_| "[]".to_string());
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -650,8 +652,8 @@ impl VoiceMcpServer {
             &config,
             speech_secs,
             silence_secs,
-            40,  // population
-            30,  // generations
+            40, // population
+            30, // generations
             dry_run,
         )
         .await
