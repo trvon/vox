@@ -13,15 +13,6 @@ Local voice MCP server with text-to-speech (Kokoro) and speech-to-text (Moonshin
 ## Install
 
 ```bash
-git clone https://github.com/trvon/vox && cd vox
-./setup.sh            # builds, installs to ~/.local/bin, downloads models (~1GB)
-```
-
-`setup.sh` builds a release binary, copies it and any shared libraries to `~/.local/bin`, downloads models, and on macOS installs a launchd plist so the daemon starts at login.
-
-Or manually:
-
-```bash
 cargo install --path .
 ```
 
