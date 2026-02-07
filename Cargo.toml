@@ -2,19 +2,23 @@
 name = "vox"
 version = "0.1.0"
 edition = "2024"
-description = "Lightweight voice MCP server with local Whisper + Kokoro inference"
+description = "Lightweight voice MCP server with local Moonshine + Kokoro inference"
 repository = "https://github.com/trvon/vox"
 license = "MIT"
 
 [dependencies]
-rmcp = { version = "0.14", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "0.14", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+axum = "0.8"
+tokio-util = "0.7"
 tokio = { version = "1", features = ["full"] }
 cpal = "0.15"
-sherpa-rs = { version = "0.6", features = ["tts", "download-binaries"] }
+sherpa-rs = { version = "0.6", features = ["tts", "download-binaries", "static"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 schemars = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 thiserror = "2"
 eyre = "0.6"
 tracing = "0.1"
@@ -26,3 +30,22 @@ tokio-stream = "0.1"
 futures = "0.3"
 tar = "0.4"
 bzip2 = "0.5"
+
+[profile.dev]
+debug = 0
+split-debuginfo = "off"
+
+[profile.test]
+debug = 0
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "tts_bench"
+harness = false
+
+[[bench]]
+name = "audio_bench"
+harness = false

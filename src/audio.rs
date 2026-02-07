@@ -72,10 +72,10 @@ fn play_audio_blocking(samples: &[f32], sample_rate: u32) -> Result<()> {
         .map_err(|e| VoiceError::Audio(format!("Failed to play stream: {e}")))?;
 
     while !finished.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     // Small buffer to let the last samples play out
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(std::time::Duration::from_millis(20));
 
     drop(stream);
     tracing::debug!("Playback complete");
@@ -209,7 +209,7 @@ pub fn start_capture() -> Result<(mpsc::Receiver<AudioChunk>, CaptureHandle)> {
 }
 
 /// Simple linear resampling
-fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+pub fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate {
         return samples.to_vec();
     }
@@ -235,4 +235,57 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resample_same_rate_is_passthrough() {
+        let input = vec![1.0, 2.0, 3.0, 4.0];
+        let output = resample(&input, 16000, 16000);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn resample_downsample_48k_to_16k() {
+        // 3:1 ratio — 12 input samples should yield 4 output samples
+        let input: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let output = resample(&input, 48000, 16000);
+        assert_eq!(output.len(), 4);
+    }
+
+    #[test]
+    fn resample_upsample_8k_to_16k() {
+        // 1:2 ratio — 4 input samples should yield 8 output samples
+        let input = vec![0.0, 1.0, 2.0, 3.0];
+        let output = resample(&input, 8000, 16000);
+        assert_eq!(output.len(), 8);
+        // First sample should be 0.0, last should approach 3.0
+        assert!((output[0] - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn resample_empty_input() {
+        let output = resample(&[], 48000, 16000);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn resample_single_sample() {
+        let input = vec![0.5];
+        let output = resample(&input, 48000, 16000);
+        // With 3:1 ratio, 1 sample / 3 ≈ 0 output samples (integer truncation)
+        // but at least it shouldn't panic
+        assert!(output.len() <= 1);
+    }
+
+    #[test]
+    fn resample_output_length_matches_ratio() {
+        let input: Vec<f32> = vec![0.0; 48000]; // 1 second at 48kHz
+        let output = resample(&input, 48000, 16000);
+        // Should be approximately 16000 samples (1 second at 16kHz)
+        assert_eq!(output.len(), 16000);
+    }
 }

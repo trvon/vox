@@ -2,6 +2,12 @@ use crate::config::Config;
 use crate::error::{Result, VoiceError};
 use sherpa_rs::silero_vad::{SileroVadConfig, SileroVad, SpeechSegment};
 
+pub(crate) const VAD_SAMPLE_RATE: u32 = 16000;
+pub(crate) const VAD_WINDOW_SIZE: usize = 512;
+pub(crate) const VAD_THRESHOLD: f32 = 0.5;
+pub(crate) const VAD_MIN_SILENCE: f32 = 0.5;
+pub(crate) const VAD_MIN_SPEECH: f32 = 0.25;
+
 pub struct VadSession {
     vad: SileroVad,
 }
@@ -10,11 +16,11 @@ impl VadSession {
     pub fn new(config: &Config, max_speech_secs: f32) -> Result<Self> {
         let vad_config = SileroVadConfig {
             model: config.vad_model_path().to_string_lossy().to_string(),
-            min_silence_duration: 0.5,
-            min_speech_duration: 0.25,
-            threshold: 0.5,
-            sample_rate: 16000,
-            window_size: 512,
+            min_silence_duration: VAD_MIN_SILENCE,
+            min_speech_duration: VAD_MIN_SPEECH,
+            threshold: VAD_THRESHOLD,
+            sample_rate: VAD_SAMPLE_RATE,
+            window_size: VAD_WINDOW_SIZE as i32,
             ..Default::default()
         };
 
@@ -67,3 +73,37 @@ impl VadSession {
 
 // SileroVad wraps a raw pointer but sherpa-rs declares Send+Sync
 unsafe impl Send for VadSession {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vad_sample_rate_is_16khz() {
+        assert_eq!(VAD_SAMPLE_RATE, 16000);
+    }
+
+    #[test]
+    fn vad_window_size_matches_silero_requirement() {
+        // Silero VAD requires 512-sample windows at 16kHz
+        assert_eq!(VAD_WINDOW_SIZE, 512);
+    }
+
+    #[test]
+    fn vad_threshold_is_balanced() {
+        // 0.5 is the standard Silero VAD threshold
+        assert!((VAD_THRESHOLD - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn vad_min_silence_allows_pauses() {
+        // 0.5s minimum silence prevents premature cutoff
+        assert!((VAD_MIN_SILENCE - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn vad_min_speech_filters_noise() {
+        // 0.25s minimum speech duration filters clicks/noise
+        assert!((VAD_MIN_SPEECH - 0.25).abs() < f32::EPSILON);
+    }
+}

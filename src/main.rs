@@ -1,5 +1,7 @@
 mod audio;
+mod cli;
 mod config;
+mod daemon;
 mod error;
 mod models;
 mod server;
@@ -7,14 +9,47 @@ mod stt;
 mod tts;
 mod vad;
 
+use clap::Parser;
+use cli::{Cli, Command, ConfigAction, DaemonAction};
 use config::Config;
 use rmcp::ServiceExt;
 
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
+fn main() -> eyre::Result<()> {
+    // Parse CLI first so --help/--version exit immediately
+    let cli = Cli::parse();
+
+    // Daemonize by re-exec with --foreground (parent returns immediately)
+    if let Some(Command::Daemon {
+        action:
+            DaemonAction::Start { foreground, port }
+            | DaemonAction::Restart { foreground, port },
+    }) = &cli.command
+        && !foreground
+    {
+        // For restart, stop the old daemon first
+        if matches!(
+            &cli.command,
+            Some(Command::Daemon {
+                action: DaemonAction::Restart { .. }
+            })
+        ) {
+            let _ = daemon::stop_daemon();
+        }
+        daemon::daemonize(*port)?;
+        return Ok(());
+    }
+
+    // Build the async runtime for the actual work
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> eyre::Result<()> {
     let config = Config::load();
 
-    // Initialize logging to stderr (stdout is reserved for MCP transport)
+    // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -23,43 +58,116 @@ async fn main() -> eyre::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Check for --download-models flag
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--download-models") {
-        eprintln!("Downloading models...");
-        models::download_models(&config).await?;
-        eprintln!("All models downloaded successfully.");
-        return Ok(());
+    match cli.command {
+        Some(Command::Config { action }) => {
+            match action {
+                ConfigAction::Get { key: Some(key) } => {
+                    match config.get_value(&key) {
+                        Some(val) => println!("{val}"),
+                        None => {
+                            eprintln!("Unknown key: {key}\nValid keys: voice, speed, model_dir, log_level");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                ConfigAction::Get { key: None } => {
+                    println!("{}", config.display_all());
+                }
+                ConfigAction::Set { key, value } => {
+                    Config::set_value(&key, &value).map_err(|e| eyre::eyre!("{e}"))?;
+                    // Reload and show the new value
+                    let config = Config::load();
+                    if let Some(val) = config.get_value(&key) {
+                        println!("{key} = {val}");
+                    }
+                }
+                ConfigAction::Path => {
+                    println!("{}", Config::config_path().display());
+                }
+            }
+        }
+        Some(Command::DownloadModels) => {
+            eprintln!("Downloading models...");
+            models::download_models(&config).await?;
+            eprintln!("All models downloaded successfully.");
+        }
+        Some(Command::Daemon { action }) => match action {
+            DaemonAction::Start { port, .. } => {
+                let port = daemon::resolve_port(port);
+
+                if let Some(state) = daemon::read_state() {
+                    eyre::bail!(
+                        "Daemon already running (pid {}, port {})",
+                        state.pid,
+                        state.port
+                    );
+                }
+
+                ensure_models(&config).await?;
+                let (tts, stt) = init_engines(&config).await?;
+                daemon::start(tts, stt, config, port).await?;
+            }
+            DaemonAction::Restart { port, .. } => {
+                // Stop if running (ignore errors if not running)
+                let _ = daemon::stop_daemon();
+                let port = daemon::resolve_port(port);
+                ensure_models(&config).await?;
+                let (tts, stt) = init_engines(&config).await?;
+                daemon::start(tts, stt, config, port).await?;
+            }
+            DaemonAction::Stop => {
+                daemon::stop_daemon()?;
+            }
+            DaemonAction::Status => {
+                let code = daemon::daemon_status();
+                std::process::exit(code);
+            }
+            DaemonAction::Log => {
+                daemon::daemon_log()?;
+            }
+        },
+        None => {
+            ensure_models(&config).await?;
+            let (tts, stt) = init_engines(&config).await?;
+            run_stdio(tts, stt, config).await?;
+        }
     }
 
-    // Check if models exist, download if needed
-    if !models::models_ready(&config) {
+    Ok(())
+}
+
+/// Download models if they aren't already present.
+async fn ensure_models(config: &Config) -> eyre::Result<()> {
+    if !models::models_ready(config) {
         eprintln!("Models not found. Downloading (this only happens once)...");
-        models::download_models(&config).await?;
+        models::download_models(config).await?;
         eprintln!("Models downloaded successfully.");
     }
+    Ok(())
+}
 
-    // Initialize engines
+/// Initialize TTS and STT engines (blocking work on spawn_blocking).
+async fn init_engines(config: &Config) -> eyre::Result<(tts::TtsEngine, stt::SttEngine)> {
     eprintln!("Initializing voice engines...");
 
     let tts_engine = {
         let config = config.clone();
-        tokio::task::spawn_blocking(move || tts::TtsEngine::new(&config))
-            .await??
+        tokio::task::spawn_blocking(move || tts::TtsEngine::new(&config)).await??
     };
 
     let stt_engine = {
         let config = config.clone();
-        tokio::task::spawn_blocking(move || stt::SttEngine::new(&config))
-            .await??
+        tokio::task::spawn_blocking(move || stt::SttEngine::new(&config)).await??
     };
 
-    eprintln!("Vox MCP server ready");
+    Ok((tts_engine, stt_engine))
+}
 
-    // Create and serve MCP server
-    let server = server::VoiceMcpServer::new(tts_engine, stt_engine, config);
+/// Run as a stdio MCP server (default, backward-compatible).
+async fn run_stdio(tts: tts::TtsEngine, stt: stt::SttEngine, config: Config) -> eyre::Result<()> {
+    eprintln!("Vox MCP server ready (stdio)");
+    let server = server::VoiceMcpServer::new(tts, stt, config);
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
-
     Ok(())
 }

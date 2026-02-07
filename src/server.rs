@@ -77,17 +77,90 @@ pub struct VoiceMcpServer {
 }
 
 impl VoiceMcpServer {
+    /// Create a new server with owned engines (wraps in Arc<Mutex<_>>).
     pub fn new(tts: TtsEngine, stt: SttEngine, config: Config) -> Self {
+        Self::with_shared(
+            Arc::new(Mutex::new(tts)),
+            Arc::new(Mutex::new(stt)),
+            Arc::new(config),
+        )
+    }
+
+    /// Create a new server with pre-shared engines (for daemon mode).
+    pub fn with_shared(
+        tts: Arc<Mutex<TtsEngine>>,
+        stt: Arc<Mutex<SttEngine>>,
+        config: Arc<Config>,
+    ) -> Self {
         Self {
-            tts: Arc::new(Mutex::new(tts)),
-            stt: Arc::new(Mutex::new(stt)),
-            config: Arc::new(config),
+            tts,
+            stt,
+            config,
             tool_router: Self::tool_router(),
         }
     }
 
-    /// Synthesize and play audio
+    /// Synthesize and play audio, streaming sentence-by-sentence for multi-sentence text.
     async fn speak(
+        &self,
+        text: &str,
+        voice: Option<&str>,
+        speed: Option<f32>,
+    ) -> std::result::Result<(), String> {
+        let sentences = crate::tts::split_sentences(text);
+
+        // Single sentence: simple path, no channel overhead
+        if sentences.len() <= 2 {
+            return self.speak_single(text, voice, speed).await;
+        }
+
+        // Multiple sentences: pipeline synthesis → playback
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<(Vec<f32>, u32)>(2);
+
+        let tts = self.tts.clone();
+        let voice = voice.map(|v| v.to_string());
+        let sentences: Vec<String> = sentences.into_iter().map(|s| s.to_string()).collect();
+
+        // Producer: synthesize sentences sequentially, send audio chunks
+        let producer = tokio::task::spawn(async move {
+            for sentence in sentences {
+                let tts = tts.clone();
+                let voice = voice.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut tts = tts.lock().map_err(|e| format!("TTS lock poisoned: {e}"))?;
+                    tts.synthesize(&sentence, voice.as_deref(), speed)
+                        .map_err(|e| format!("TTS failed: {e}"))
+                })
+                .await
+                .map_err(|e| format!("TTS task failed: {e}"))??;
+
+                if tx.send((result.samples, result.sample_rate)).await.is_err() {
+                    break; // consumer dropped
+                }
+            }
+            Ok::<(), String>(())
+        });
+
+        // Consumer: play audio chunks as they arrive
+        let consumer = tokio::task::spawn(async move {
+            while let Some((samples, sample_rate)) = rx.recv().await {
+                audio::play_audio(samples, sample_rate)
+                    .await
+                    .map_err(|e| format!("Playback failed: {e}"))?;
+            }
+            Ok::<(), String>(())
+        });
+
+        let (prod_result, cons_result) = tokio::join!(producer, consumer);
+        prod_result.map_err(|e| format!("Producer task failed: {e}"))??;
+        cons_result.map_err(|e| format!("Consumer task failed: {e}"))??;
+
+        Ok(())
+    }
+
+    /// Synthesize and play a single chunk of text (no pipelining).
+    async fn speak_single(
         &self,
         text: &str,
         voice: Option<&str>,
@@ -281,5 +354,94 @@ impl ServerHandler for VoiceMcpServer {
                     .to_string(),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_true_returns_true() {
+        assert!(default_true());
+    }
+
+    #[test]
+    fn default_speed_returns_one() {
+        assert!((default_speed() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn default_timeout_returns_30() {
+        assert_eq!(default_timeout(), 30);
+    }
+
+    #[test]
+    fn converse_params_defaults() {
+        let json = serde_json::json!({
+            "message": "Hello"
+        });
+        let params: ConverseParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.message, "Hello");
+        assert!(params.wait_for_response);
+        assert!((params.speed - 1.0).abs() < f32::EPSILON);
+        assert_eq!(params.timeout_secs, 30);
+        assert!(params.voice.is_none());
+    }
+
+    #[test]
+    fn converse_params_with_overrides() {
+        let json = serde_json::json!({
+            "message": "Test",
+            "wait_for_response": false,
+            "voice": "am_michael",
+            "speed": 1.5,
+            "timeout_secs": 60
+        });
+        let params: ConverseParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.message, "Test");
+        assert!(!params.wait_for_response);
+        assert_eq!(params.voice.as_deref(), Some("am_michael"));
+        assert!((params.speed - 1.5).abs() < f32::EPSILON);
+        assert_eq!(params.timeout_secs, 60);
+    }
+
+    #[test]
+    fn say_params_minimal() {
+        let json = serde_json::json!({
+            "message": "Hello world"
+        });
+        let params: SayParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.message, "Hello world");
+        assert!(params.voice.is_none());
+        assert!((params.speed - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn say_params_with_voice_and_speed() {
+        let json = serde_json::json!({
+            "message": "Test",
+            "voice": "af_bella",
+            "speed": 2.0
+        });
+        let params: SayParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.voice.as_deref(), Some("af_bella"));
+        assert!((params.speed - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn listen_params_default_timeout() {
+        let json = serde_json::json!({});
+        let params: ListenParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.timeout_secs, 30);
+    }
+
+    #[test]
+    fn listen_params_custom_timeout() {
+        let json = serde_json::json!({
+            "timeout_secs": 10
+        });
+        let params: ListenParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.timeout_secs, 10);
     }
 }

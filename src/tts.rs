@@ -112,7 +112,7 @@ impl TtsEngine {
     }
 }
 
-fn resolve_voice_id(name: &str) -> i32 {
+pub fn resolve_voice_id(name: &str) -> i32 {
     VOICE_MAP
         .iter()
         .find(|(n, _)| *n == name)
@@ -125,3 +125,133 @@ fn resolve_voice_id(name: &str) -> i32 {
 
 // TtsEngine wraps a raw pointer but sherpa-rs declares Send+Sync on it
 unsafe impl Send for TtsEngine {}
+
+/// Split text into sentences on sentence-ending punctuation followed by whitespace.
+/// Returns the original text as a single-element slice if no split points are found.
+pub fn split_sentences(text: &str) -> Vec<&str> {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if (b == b'.' || b == b'!' || b == b'?')
+            && i + 1 < bytes.len()
+            && bytes[i + 1].is_ascii_whitespace()
+        {
+            let sentence = text[start..=i].trim();
+            if !sentence.is_empty() {
+                sentences.push(sentence);
+            }
+            start = i + 1;
+        }
+    }
+
+    // Remaining tail
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        sentences.push(tail);
+    }
+
+    if sentences.is_empty() {
+        sentences.push(text);
+    }
+
+    sentences
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn all_named_voices_resolve_correctly() {
+        for &(name, expected_id) in VOICE_MAP {
+            assert_eq!(
+                resolve_voice_id(name),
+                expected_id,
+                "Voice '{name}' should resolve to {expected_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_map_has_26_entries() {
+        assert_eq!(VOICE_MAP.len(), 26);
+    }
+
+    #[test]
+    fn unknown_voice_falls_back_to_numeric() {
+        assert_eq!(resolve_voice_id("5"), 5);
+        assert_eq!(resolve_voice_id("25"), 25);
+        assert_eq!(resolve_voice_id("0"), 0);
+    }
+
+    #[test]
+    fn completely_unknown_voice_falls_back_to_zero() {
+        assert_eq!(resolve_voice_id("nonexistent_voice"), 0);
+        assert_eq!(resolve_voice_id(""), 0);
+    }
+
+    #[test]
+    fn voice_map_has_no_duplicate_ids() {
+        let ids: Vec<i32> = VOICE_MAP.iter().map(|(_, id)| *id).collect();
+        let unique: HashSet<i32> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), unique.len(), "VOICE_MAP contains duplicate IDs");
+    }
+
+    #[test]
+    fn voice_map_has_no_duplicate_names() {
+        let names: Vec<&str> = VOICE_MAP.iter().map(|(n, _)| *n).collect();
+        let unique: HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "VOICE_MAP contains duplicate names"
+        );
+    }
+
+    #[test]
+    fn voice_ids_are_sequential_0_to_25() {
+        for (i, &(_, id)) in VOICE_MAP.iter().enumerate() {
+            assert_eq!(id, i as i32, "Voice at index {i} has non-sequential ID {id}");
+        }
+    }
+
+    #[test]
+    fn split_sentences_single() {
+        let result = split_sentences("Hello world");
+        assert_eq!(result, vec!["Hello world"]);
+    }
+
+    #[test]
+    fn split_sentences_two() {
+        let result = split_sentences("Hello world. How are you?");
+        assert_eq!(result, vec!["Hello world.", "How are you?"]);
+    }
+
+    #[test]
+    fn split_sentences_three() {
+        let result = split_sentences("First. Second! Third? Tail");
+        assert_eq!(result, vec!["First.", "Second!", "Third?", "Tail"]);
+    }
+
+    #[test]
+    fn split_sentences_trailing_period_no_space() {
+        let result = split_sentences("Hello world.");
+        assert_eq!(result, vec!["Hello world."]);
+    }
+
+    #[test]
+    fn split_sentences_empty() {
+        let result = split_sentences("");
+        assert_eq!(result, vec![""]);
+    }
+
+    #[test]
+    fn split_sentences_abbreviation_no_split() {
+        // "Dr.Smith" has no space after period, should not split
+        let result = split_sentences("Dr.Smith is here");
+        assert_eq!(result, vec!["Dr.Smith is here"]);
+    }
+}
