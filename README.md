@@ -17,14 +17,6 @@ Local voice MCP server with text-to-speech (Kokoro) and speech-to-text (Moonshin
 
 ## Install
 
-### npm (recommended)
-
-```bash
-npx vox-mcp
-# or
-npm install -g vox-mcp
-```
-
 ### From source
 
 ```bash
