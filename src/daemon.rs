@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::stt::SttEngine;
 use crate::tts::TtsEngine;
 
@@ -146,7 +146,8 @@ pub async fn start(tts: TtsEngine, stt: SttEngine, config: Config, port: u16) ->
 
     let tts = Arc::new(Mutex::new(tts));
     let stt = Arc::new(Mutex::new(stt));
-    let config = Arc::new(config);
+    let config = config.into_shared();
+    let _watcher = config::start_config_watcher(config.clone());
 
     let ct = tokio_util::sync::CancellationToken::new();
 

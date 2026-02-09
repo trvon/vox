@@ -1,4 +1,4 @@
-use vox::config::Config;
+use vox::config::{Config, SharedConfig};
 
 #[test]
 fn config_roundtrip_with_dsp() {
@@ -146,19 +146,26 @@ fn set_value_dsp_keys_via_toml_manipulation() {
     assert!((config.dsp.normalize_threshold - 0.8).abs() < f32::EPSILON);
 }
 
-/// Documents that config changes require a daemon restart.
-/// set_value() writes to disk but does NOT affect a running VoiceMcpServer.
+/// Verify that SharedConfig reload updates the running snapshot,
+/// while old clones remain unaffected.
 #[test]
-fn config_no_hot_reload_documented() {
-    // The Config struct is cloned into Arc<Config> at server startup.
-    // Subsequent set_value() calls write to disk but the running server
-    // holds an immutable snapshot. A restart is required for changes to
-    // take effect. This test exists to document that limitation.
+fn shared_config_reload_updates_running_snapshot() {
     let config = Config::default();
-    let snapshot = config.clone();
+    let shared: SharedConfig = config.into_shared();
 
-    // Even if we could modify the original, the snapshot is independent
-    assert!((snapshot.dsp.hpf_cutoff_hz - 200.0).abs() < f64::EPSILON);
+    // Take a snapshot before reload
+    let old_snapshot = shared.read().unwrap().clone();
+    assert!((old_snapshot.dsp.hpf_cutoff_hz - 200.0).abs() < f64::EPSILON);
+
+    // Reload — reads from disk (or defaults if no config file)
+    Config::reload_into(&shared).unwrap();
+
+    // New reads from the SharedConfig see the reloaded values
+    let new_snapshot = shared.read().unwrap().clone();
+    assert!(!new_snapshot.voice.is_empty());
+
+    // Old snapshot is unaffected (it's an independent clone)
+    assert!((old_snapshot.dsp.hpf_cutoff_hz - 200.0).abs() < f64::EPSILON);
 }
 
 #[test]

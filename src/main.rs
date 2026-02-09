@@ -210,6 +210,8 @@ async fn init_engines(config: &Config) -> eyre::Result<(tts::TtsEngine, stt::Stt
 /// Run as a stdio MCP server (default, backward-compatible).
 async fn run_stdio(tts: tts::TtsEngine, stt: stt::SttEngine, config: Config) -> eyre::Result<()> {
     eprintln!("Vox MCP server ready (stdio)");
+    let config = config.into_shared();
+    let _watcher = config::start_config_watcher(config.clone());
     let server = server::VoiceMcpServer::new(tts, stt, config);
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;

@@ -1,7 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 const APP_NAME: &str = "vox";
+
+/// Thread-safe shared config: readable by many, writable on reload.
+pub type SharedConfig = Arc<RwLock<Config>>;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
@@ -76,6 +80,21 @@ fn config_path() -> PathBuf {
 }
 
 impl Config {
+    /// Wrap this config in a SharedConfig (Arc<RwLock<Config>>).
+    pub fn into_shared(self) -> SharedConfig {
+        Arc::new(RwLock::new(self))
+    }
+
+    /// Reload config from disk and swap it into the shared handle.
+    pub fn reload_into(shared: &SharedConfig) -> Result<(), String> {
+        let new = Config::load();
+        *shared
+            .write()
+            .map_err(|e| format!("Config lock poisoned: {e}"))? = new;
+        tracing::info!("Config reloaded from disk");
+        Ok(())
+    }
+
     pub fn load() -> Self {
         let mut config = Self::default();
 
@@ -293,6 +312,71 @@ impl Config {
     }
 }
 
+/// Start a file watcher on the config TOML. Returns the watcher handle — caller
+/// must keep it alive (drop stops watching). Returns `None` if the watcher
+/// cannot be created (e.g. parent dir doesn't exist yet).
+pub fn start_config_watcher(shared: SharedConfig) -> Option<notify::RecommendedWatcher> {
+    use notify::{EventKind, RecursiveMode, Watcher};
+
+    let config_file = config_path();
+    let parent = config_file.parent()?.to_path_buf();
+    let file_name = config_file.file_name()?.to_os_string();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
+        if let Ok(event) = res {
+            match event.kind {
+                EventKind::Create(_) | EventKind::Modify(_) => {
+                    // Only care about our config file (editors may rename temp files in parent dir)
+                    let dominated = event
+                        .paths
+                        .iter()
+                        .any(|p| p.file_name().map(|n| n == file_name).unwrap_or(false));
+                    if dominated {
+                        let _ = tx.send(());
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .ok()?;
+
+    // Watch parent dir (handles atomic renames from editors like vim/emacs)
+    watcher.watch(&parent, RecursiveMode::NonRecursive).ok()?;
+
+    // Background thread: debounce events and reload
+    std::thread::Builder::new()
+        .name("config-watcher".into())
+        .spawn(move || {
+            loop {
+                // Block until first event
+                if rx.recv().is_err() {
+                    break; // sender dropped (watcher dropped)
+                }
+                // Debounce: drain for 500ms
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    if rx.recv_timeout(remaining).is_err() {
+                        break; // timeout or sender dropped
+                    }
+                }
+                // Reload
+                if let Err(e) = Config::reload_into(&shared) {
+                    tracing::error!("Config hot-reload failed: {e}");
+                }
+            }
+        })
+        .ok()?;
+
+    Some(watcher)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,12 +512,20 @@ mod tests {
         assert!(config.get_value("nonexistent").is_none());
     }
 
-    /// Config changes via set_value require a daemon restart to take effect.
-    /// set_value persists to disk but does NOT affect a running server instance.
+    /// Verify that reload_into swaps config in a SharedConfig.
     #[test]
-    fn set_value_does_not_hot_reload() {
-        // This test documents the intentional no-hot-reload behavior.
-        // set_value writes to disk; the running Config struct is immutable.
-        // A restart is required to pick up changes.
+    fn reload_into_updates_shared_config() {
+        let config = Config::default();
+        let shared = config.into_shared();
+
+        // Before reload: default voice
+        assert_eq!(shared.read().unwrap().voice, "af_heart");
+
+        // reload_into re-reads from disk (or defaults if no file), so the
+        // SharedConfig should still have valid data after reload.
+        Config::reload_into(&shared).unwrap();
+        let reloaded = shared.read().unwrap();
+        // Voice should still be valid (either from disk or default)
+        assert!(!reloaded.voice.is_empty());
     }
 }

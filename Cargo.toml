@@ -24,7 +24,7 @@ thiserror = "2"
 eyre = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", features = ["stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 dirs = "6"
 indicatif = "0.17"
 console = "0.15"
@@ -33,6 +33,7 @@ tokio-stream = "0.1"
 futures = "0.3"
 tar = "0.4"
 bzip2 = "0.5"
+notify = "7"
 
 [profile.release]
 lto = "fat"

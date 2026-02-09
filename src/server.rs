@@ -1,5 +1,5 @@
 use crate::audio::{self, CaptureHandle};
-use crate::config::Config;
+use crate::config::{Config, SharedConfig};
 use crate::stt::SttEngine;
 use crate::tts::TtsEngine;
 use crate::vad::VadSession;
@@ -32,10 +32,6 @@ pub struct ConverseParams {
     #[serde(default = "default_speed")]
     pub speed: f32,
 
-    #[schemars(description = "Maximum listen time in seconds (default: 30)")]
-    #[serde(default = "default_timeout")]
-    pub timeout_secs: u32,
-
     #[schemars(description = "Silence duration in ms before end-of-turn (default: 1000)")]
     #[serde(default = "default_silence_timeout")]
     pub silence_timeout_ms: u32,
@@ -61,10 +57,6 @@ pub struct SayParams {
 /// MCP tool parameters for the `listen` tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ListenParams {
-    #[schemars(description = "Maximum listen time in seconds (default: 30)")]
-    #[serde(default = "default_timeout")]
-    pub timeout_secs: u32,
-
     #[schemars(description = "Silence duration in ms before end-of-turn (default: 1000)")]
     #[serde(default = "default_silence_timeout")]
     pub silence_timeout_ms: u32,
@@ -88,6 +80,10 @@ pub struct StopListeningParams {}
 /// MCP tool parameters for `reset_dsp` (no params)
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ResetDspParams {}
+
+/// MCP tool parameters for `reload_config` (no params)
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ReloadConfigParams {}
 
 /// MCP tool parameters for `calibrate`
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -141,10 +137,6 @@ fn default_speed() -> f32 {
     1.0
 }
 
-fn default_timeout() -> u32 {
-    30
-}
-
 fn default_silence_timeout() -> u32 {
     1500
 }
@@ -153,7 +145,7 @@ fn default_silence_timeout() -> u32 {
 pub struct VoiceMcpServer {
     tts: Arc<Mutex<TtsEngine>>,
     stt: Arc<Mutex<SttEngine>>,
-    config: Arc<Config>,
+    config: SharedConfig,
     processor: Arc<TokioMutex<OperationProcessor>>,
     tool_router: ToolRouter<Self>,
     inbox: Arc<Mutex<Vec<InboxMessage>>>,
@@ -163,19 +155,15 @@ pub struct VoiceMcpServer {
 
 impl VoiceMcpServer {
     /// Create a new server with owned engines (wraps in Arc<Mutex<_>>).
-    pub fn new(tts: TtsEngine, stt: SttEngine, config: Config) -> Self {
-        Self::with_shared(
-            Arc::new(Mutex::new(tts)),
-            Arc::new(Mutex::new(stt)),
-            Arc::new(config),
-        )
+    pub fn new(tts: TtsEngine, stt: SttEngine, config: SharedConfig) -> Self {
+        Self::with_shared(Arc::new(Mutex::new(tts)), Arc::new(Mutex::new(stt)), config)
     }
 
     /// Create a new server with pre-shared engines (for daemon mode).
     pub fn with_shared(
         tts: Arc<Mutex<TtsEngine>>,
         stt: Arc<Mutex<SttEngine>>,
-        config: Arc<Config>,
+        config: SharedConfig,
     ) -> Self {
         Self {
             tts,
@@ -231,15 +219,14 @@ impl VoiceMcpServer {
     /// Record and transcribe speech
     async fn record_and_transcribe(
         &self,
-        timeout_secs: u32,
         silence_timeout_ms: u32,
         min_speech_ms: Option<u32>,
     ) -> std::result::Result<String, String> {
         if self.bg_active.load(Ordering::Relaxed) {
             return Err("Background listener is active. Call stop_listening first.".to_string());
         }
-        let config = self.config.clone();
-        let max_speech_secs = timeout_secs as f32;
+        let config = self.config.read().unwrap().clone();
+        let max_speech_secs = 120.0_f32; // safety cap for VAD
 
         let (mut rx, capture_handle) = audio::start_capture(
             config.dsp.hpf_cutoff_hz,
@@ -248,7 +235,7 @@ impl VoiceMcpServer {
         )
         .map_err(|e| format!("Capture failed: {e}"))?;
 
-        let timeout_duration = std::time::Duration::from_secs(timeout_secs as u64);
+        let timeout_duration = std::time::Duration::from_secs(120);
         let start = std::time::Instant::now();
 
         let mut all_speech_samples: Vec<f32> = Vec::new();
@@ -371,11 +358,7 @@ impl VoiceMcpServer {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         let text = self
-            .record_and_transcribe(
-                params.timeout_secs,
-                params.silence_timeout_ms,
-                params.min_speech_ms,
-            )
+            .record_and_transcribe(params.silence_timeout_ms, params.min_speech_ms)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
 
@@ -412,11 +395,7 @@ impl VoiceMcpServer {
         Parameters(params): Parameters<ListenParams>,
     ) -> Result<CallToolResult, McpError> {
         let text = self
-            .record_and_transcribe(
-                params.timeout_secs,
-                params.silence_timeout_ms,
-                params.min_speech_ms,
-            )
+            .record_and_transcribe(params.silence_timeout_ms, params.min_speech_ms)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
 
@@ -438,7 +417,7 @@ impl VoiceMcpServer {
             ));
         }
 
-        let config = self.config.clone();
+        let config = self.config.read().unwrap().clone();
         let (mut rx, capture_handle) = audio::start_capture(
             config.dsp.hpf_cutoff_hz,
             config.dsp.noise_gate_rms,
@@ -612,26 +591,40 @@ impl VoiceMcpServer {
 
     #[tool(
         name = "reset_dsp",
-        description = "Reset DSP audio parameters to defaults. Removes custom calibration values from config. Restart daemon to apply."
+        description = "Reset DSP audio parameters to defaults. Removes custom calibration values from config."
     )]
     async fn reset_dsp(
         &self,
         Parameters(_params): Parameters<ResetDspParams>,
     ) -> Result<CallToolResult, McpError> {
         Config::reset_dsp().map_err(|e| McpError::internal_error(e, None))?;
+        Config::reload_into(&self.config).map_err(|e| McpError::internal_error(e, None))?;
         let defaults = crate::config::DspConfig::default();
         let msg = format!(
-            "DSP parameters reset to defaults:\n  \
+            "DSP parameters reset to defaults and applied:\n  \
              hpf_cutoff_hz:       {}\n  \
              noise_gate_rms:      {}\n  \
              noise_gate_window:   {}\n  \
-             normalize_threshold: {}\n\n\
-             Restart daemon to apply.",
+             normalize_threshold: {}",
             defaults.hpf_cutoff_hz,
             defaults.noise_gate_rms,
             defaults.noise_gate_window,
             defaults.normalize_threshold,
         );
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
+    }
+
+    #[tool(
+        name = "reload_config",
+        description = "Reload config from disk. Use after manually editing the config TOML file. Returns the current config values."
+    )]
+    async fn reload_config(
+        &self,
+        Parameters(_params): Parameters<ReloadConfigParams>,
+    ) -> Result<CallToolResult, McpError> {
+        Config::reload_into(&self.config).map_err(|e| McpError::internal_error(e, None))?;
+        let config = self.config.read().unwrap();
+        let msg = format!("Config reloaded:\n\n{}", config.display_all());
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
@@ -643,7 +636,7 @@ impl VoiceMcpServer {
         &self,
         Parameters(params): Parameters<CalibrateParams>,
     ) -> Result<CallToolResult, McpError> {
-        let config = (*self.config).clone();
+        let config = self.config.read().unwrap().clone();
         let speech_secs = params.speech_secs.unwrap_or(10);
         let silence_secs = params.silence_secs.unwrap_or(5);
         let dry_run = params.dry_run;
@@ -659,10 +652,15 @@ impl VoiceMcpServer {
         .await
         .map_err(|e| McpError::internal_error(format!("Calibration failed: {e}"), None))?;
 
+        // Auto-reload config so new DSP params take effect immediately
+        if !dry_run {
+            Config::reload_into(&self.config).map_err(|e| McpError::internal_error(e, None))?;
+        }
+
         let status = if dry_run {
             "Results NOT saved (dry_run=true). Set dry_run=false to persist."
         } else {
-            "Results saved to config. Restart daemon to apply."
+            "Results saved and applied to running server."
         };
 
         let msg = format!(
@@ -727,11 +725,6 @@ mod tests {
     }
 
     #[test]
-    fn default_timeout_returns_30() {
-        assert_eq!(default_timeout(), 30);
-    }
-
-    #[test]
     fn default_silence_timeout_returns_1500() {
         assert_eq!(default_silence_timeout(), 1500);
     }
@@ -745,7 +738,6 @@ mod tests {
         assert_eq!(params.message, "Hello");
         assert!(params.wait_for_response);
         assert!((params.speed - 1.0).abs() < f32::EPSILON);
-        assert_eq!(params.timeout_secs, 30);
         assert!(params.voice.is_none());
         assert_eq!(params.silence_timeout_ms, 1500);
         assert!(params.min_speech_ms.is_none());
@@ -758,7 +750,6 @@ mod tests {
             "wait_for_response": false,
             "voice": "am_michael",
             "speed": 1.5,
-            "timeout_secs": 60,
             "silence_timeout_ms": 500,
             "min_speech_ms": 2000
         });
@@ -767,7 +758,6 @@ mod tests {
         assert!(!params.wait_for_response);
         assert_eq!(params.voice.as_deref(), Some("am_michael"));
         assert!((params.speed - 1.5).abs() < f32::EPSILON);
-        assert_eq!(params.timeout_secs, 60);
         assert_eq!(params.silence_timeout_ms, 500);
         assert_eq!(params.min_speech_ms, Some(2000));
     }
@@ -796,23 +786,20 @@ mod tests {
     }
 
     #[test]
-    fn listen_params_default_timeout() {
+    fn listen_params_defaults() {
         let json = serde_json::json!({});
         let params: ListenParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.timeout_secs, 30);
         assert_eq!(params.silence_timeout_ms, 1500);
         assert!(params.min_speech_ms.is_none());
     }
 
     #[test]
-    fn listen_params_custom_timeout() {
+    fn listen_params_with_overrides() {
         let json = serde_json::json!({
-            "timeout_secs": 10,
             "silence_timeout_ms": 750,
             "min_speech_ms": 1500
         });
         let params: ListenParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.timeout_secs, 10);
         assert_eq!(params.silence_timeout_ms, 750);
         assert_eq!(params.min_speech_ms, Some(1500));
     }
@@ -878,6 +865,12 @@ mod tests {
     fn reset_dsp_params_deserialize() {
         let json = serde_json::json!({});
         let _params: ResetDspParams = serde_json::from_value(json).unwrap();
+    }
+
+    #[test]
+    fn reload_config_params_deserialize() {
+        let json = serde_json::json!({});
+        let _params: ReloadConfigParams = serde_json::from_value(json).unwrap();
     }
 
     #[test]
