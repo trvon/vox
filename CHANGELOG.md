@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/trvon/vox/compare/v0.1.0...v0.2.0) (2026-02-09)
+
+
+### Features
+
+* removing timout for MCP, updating ci ([611044b](https://github.com/trvon/vox/commit/611044b099e32a034b45b3a2a56879f5fc0d02f0))
+
 ## 0.1.0 (2026-02-08)
 
 
