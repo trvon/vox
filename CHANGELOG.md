@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/trvon/vox/compare/v0.2.0...v0.3.0) (2026-02-13)
+
+
+### Features
+
+* quality of life improvements ([14ef7d5](https://github.com/trvon/vox/commit/14ef7d5b5e9b19886727823ffc38c06b8a1dc832))
+
+
+### Bug Fixes
+
+* linux build fixes ([fcfe811](https://github.com/trvon/vox/commit/fcfe81111b73145fb82870bbe950840ce00a13b8))
+
 ## [0.2.0](https://github.com/trvon/vox/compare/v0.1.0...v0.2.0) (2026-02-09)
 
 

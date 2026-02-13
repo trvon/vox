@@ -1,6 +1,6 @@
 [package]
 name = "vox"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Lightweight voice MCP server with local Moonshine + Kokoro inference"
 repository = "https://github.com/trvon/vox"
