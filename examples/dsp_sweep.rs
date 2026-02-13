@@ -108,7 +108,11 @@ fn rejection_ratio(samples: &[f32]) -> f64 {
     let high = goertzel_magnitude(samples, 300.0, SAMPLE_RATE)
         + goertzel_magnitude(samples, 1000.0, SAMPLE_RATE)
         + goertzel_magnitude(samples, 3000.0, SAMPLE_RATE);
-    if high > 0.0 { low / high } else { 0.0 }
+    if high > 0.0 {
+        low / high
+    } else {
+        0.0
+    }
 }
 
 /// Speech band retention: energy at speech freqs before/after processing
@@ -131,7 +135,7 @@ fn speech_retention(original: &[f32], processed: &[f32]) -> f64 {
 
 /// Apply the full DSP chain with given parameters
 fn apply_chain(
-    samples: &mut Vec<f32>,
+    samples: &mut [f32],
     hpf_cutoff: f64,
     noise_gate_rms: f32,
     normalize_threshold: f32,
@@ -215,8 +219,8 @@ fn main() {
 
     // Sort by composite score: high retention + low rejection + positive SNR improvement
     results.sort_by(|a, b| {
-        let score_a = a.retention - a.rejection as f64 + a.snr_improvement_db as f64 * 0.1;
-        let score_b = b.retention - b.rejection as f64 + b.snr_improvement_db as f64 * 0.1;
+        let score_a = a.retention - a.rejection + a.snr_improvement_db as f64 * 0.1;
+        let score_b = b.retention - b.rejection + b.snr_improvement_db as f64 * 0.1;
         score_b
             .partial_cmp(&score_a)
             .unwrap_or(std::cmp::Ordering::Equal)

@@ -34,6 +34,7 @@ pub struct Config {
     pub voice: String,
     pub speed: f32,
     pub log_level: String,
+    pub tts_num_threads: Option<i32>,
     pub dsp: DspConfig,
 }
 
@@ -44,6 +45,7 @@ impl Default for Config {
             voice: "af_heart".to_string(),
             speed: 1.4,
             log_level: "info".to_string(),
+            tts_num_threads: None,
             dsp: DspConfig::default(),
         }
     }
@@ -124,6 +126,11 @@ impl Config {
         }
         if let Ok(val) = std::env::var("VOX_LOG_LEVEL") {
             config.log_level = val;
+        }
+        if let Ok(val) = std::env::var("VOX_TTS_THREADS")
+            && let Ok(threads) = val.parse()
+        {
+            config.tts_num_threads = Some(threads);
         }
 
         // DSP env overrides
