@@ -11,24 +11,50 @@ PLIST_DIR="${HOME}/Library/LaunchAgents"
 PLIST_PATH="${PLIST_DIR}/${PLIST_LABEL}.plist"
 DAEMON_PORT=3030
 
-echo "==> Building vox (release)..."
+OS="$(uname)"
+
+die() {
+    # %b interprets backslash escapes in the message
+    printf 'error: %b\n' "$*" >&2
+    exit 1
+}
+
+info() {
+    echo "==> $*"
+}
+
+if [[ "${OS}" == "Linux" ]]; then
+    if ! command -v pkg-config >/dev/null 2>&1; then
+        die "pkg-config is required on Linux. Install it (and ALSA dev headers) then rerun: \n\n  Debian/Ubuntu: sudo apt install -y pkg-config libasound2-dev\n  Fedora:        sudo dnf install -y pkgconf-pkg-config alsa-lib-devel\n  Arch:          sudo pacman -S --needed pkgconf alsa-lib\n  Alpine:        sudo apk add pkgconf alsa-lib-dev\n"
+    fi
+
+    if ! pkg-config --exists alsa >/dev/null 2>&1; then
+        die "ALSA development files not found (missing alsa.pc). Install ALSA dev headers then rerun: \n\n  Debian/Ubuntu: sudo apt install -y libasound2-dev\n  Fedora:        sudo dnf install -y alsa-lib-devel\n  Arch:          sudo pacman -S --needed alsa-lib\n  Alpine:        sudo apk add alsa-lib-dev\n"
+    fi
+fi
+
+info "Building vox (release)..."
 cargo build --release
 
-echo "==> Installing binary to ${INSTALL_DIR}/"
+info "Installing binary to ${INSTALL_DIR}/"
 mkdir -p "${INSTALL_DIR}"
 cp target/release/vox "${INSTALL_DIR}/vox"
 
 # Copy all required shared libraries next to binary
-for lib in target/release/*.dylib target/release/*.so target/release/*.so.* 2>/dev/null; do
-    [ -f "${lib}" ] && cp "${lib}" "${INSTALL_DIR}/" && echo "==> Installed $(basename "${lib}")"
+shopt -s nullglob
+libs=(target/release/*.dylib target/release/*.so target/release/*.so.*)
+for lib in "${libs[@]}"; do
+    cp "${lib}" "${INSTALL_DIR}/"
+    info "Installed $(basename "${lib}")"
 done
+shopt -u nullglob
 
-echo "==> Downloading models to ${DATA_DIR}/models/..."
+info "Downloading models to ${DATA_DIR}/models/..."
 "${INSTALL_DIR}/vox" download-models
 
 # --- Daemon setup (macOS launchd) ---
-if [[ "$(uname)" == "Darwin" ]]; then
-    echo "==> Installing launchd plist → ${PLIST_PATH}"
+if [[ "${OS}" == "Darwin" ]]; then
+    info "Installing launchd plist → ${PLIST_PATH}"
     mkdir -p "${PLIST_DIR}" "${DATA_DIR}"
 
     # Unload existing plist if loaded
@@ -63,15 +89,15 @@ if [[ "$(uname)" == "Darwin" ]]; then
 </plist>
 PLIST
 
-    echo "==> Loading daemon..."
+    info "Loading daemon..."
     launchctl bootstrap "gui/$(id -u)" "${PLIST_PATH}"
 
     # Wait briefly for the daemon to start
     sleep 2
-    if curl -sf "http://localhost:${DAEMON_PORT}/mcp" -o /dev/null 2>/dev/null; then
-        echo "==> Daemon is running on http://localhost:${DAEMON_PORT}/mcp"
+    if command -v curl >/dev/null 2>&1 && curl -sf "http://localhost:${DAEMON_PORT}/mcp" -o /dev/null 2>/dev/null; then
+        info "Daemon is running on http://localhost:${DAEMON_PORT}/mcp"
     else
-        echo "==> Daemon loaded (check ${DATA_DIR}/vox-daemon.log if it fails to start)"
+        info "Daemon loaded (check ${DATA_DIR}/vox-daemon.log if it fails to start)"
     fi
 fi
 
@@ -94,4 +120,10 @@ echo ""
 if ! echo "${PATH}" | tr ':' '\n' | grep -qx "${INSTALL_DIR}"; then
     echo "Note: ${INSTALL_DIR} is not on your PATH."
     echo "  Add it:  export PATH=\"${INSTALL_DIR}:\${PATH}\""
+fi
+
+if [[ "${OS}" == "Linux" ]]; then
+    echo ""
+    echo "Linux note: setup.sh does not install a service manager."
+    echo "  Start the daemon manually:  ${INSTALL_DIR}/vox daemon start"
 fi

@@ -19,8 +19,49 @@ Local voice MCP server with text-to-speech (Kokoro) and speech-to-text (Moonshin
 
 ### From source
 
+#### Build prerequisites (Linux)
+
+On Linux, `cpal` uses ALSA by default. You must have `pkg-config` and the ALSA development headers installed or builds will fail with an `alsa-sys` / `alsa.pc` error.
+
+Debian/Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y pkg-config libasound2-dev
+```
+
+Fedora:
+
+```bash
+sudo dnf install -y pkgconf-pkg-config alsa-lib-devel
+```
+
+Arch:
+
+```bash
+sudo pacman -S --needed pkgconf alsa-lib
+```
+
+Alpine:
+
+```bash
+sudo apk add pkgconf alsa-lib-dev
+```
+
+#### sherpa-onnx linking notes (Linux)
+
+Vox uses `sherpa-rs`/`sherpa-rs-sys` with prebuilt sherpa-onnx binaries. On Linux, the sherpa-onnx **static** release archive does not ship linkable `.a` libraries, so enabling the `static` feature can lead to linker errors like `undefined symbol: SherpaOnnx*`. Use the default shared-library setup (the repo default) unless you are building sherpa-onnx from source.
+
 ```bash
 cargo install --path .
+```
+
+#### Optional: guided setup
+
+`setup.sh` builds a release binary, installs it to `~/.local/bin` by default, downloads models, and (on macOS) configures a launchd agent for daemon mode.
+
+```bash
+./setup.sh
 ```
 
 ## MCP Configuration
@@ -164,3 +205,47 @@ See [BENCHMARKS.md](BENCHMARKS.md) for benchmark documentation and performance d
 ## License
 
 MIT
+
+## Troubleshooting
+
+### `alsa-sys` build failure on Linux
+
+If you see errors like:
+
+```
+failed to run custom build command for `alsa-sys`
+The system library `alsa` required by crate `alsa-sys` was not found.
+The file `alsa.pc` needs to be installed
+```
+
+Install ALSA development headers + `pkg-config`:
+
+Debian/Ubuntu:
+
+```bash
+sudo apt install -y pkg-config libasound2-dev
+```
+
+Fedora:
+
+```bash
+sudo dnf install -y pkgconf-pkg-config alsa-lib-devel
+```
+
+Arch:
+
+```bash
+sudo pacman -S --needed pkgconf alsa-lib
+```
+
+Alpine:
+
+```bash
+sudo apk add pkgconf alsa-lib-dev
+```
+
+Then verify:
+
+```bash
+pkg-config --libs --cflags alsa
+```

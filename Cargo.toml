@@ -12,8 +12,10 @@ axum = "0.8"
 tokio-util = "0.7"
 tokio = { version = "1", features = ["full"] }
 cpal = "0.15"
-sherpa-rs = { version = "0.6", features = ["tts", "download-binaries", "static"] }
-sherpa-rs-sys = { version = "0.6", features = ["download-binaries", "static"] }
+# On Linux, the sherpa-onnx "static" release archive does not ship linkable .a files,
+# which results in undefined SherpaOnnx* symbols at link time. Use shared libs.
+sherpa-rs = { version = "0.6", features = ["tts", "download-binaries"] }
+sherpa-rs-sys = { version = "0.6", features = ["download-binaries", "tts"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

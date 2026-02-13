@@ -956,7 +956,7 @@ mod tests {
         assert!(params.wait_for_response);
         assert!((params.speed - 1.0).abs() < f32::EPSILON);
         assert!(params.voice.is_none());
-        assert_eq!(params.silence_timeout_ms, 1500);
+        assert_eq!(params.silence_timeout_ms, 2500);
         assert!(params.min_speech_ms.is_none());
     }
 
