@@ -1,5 +1,6 @@
 use crate::config::{Config, KokoroModel};
 use crate::error::{Result, VoiceError};
+use std::path::Component;
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
@@ -128,14 +129,24 @@ async fn download_and_extract_tar_bz2(url: &str, dest_dir: &Path) -> Result<()> 
 
     let total = response.content_length();
     let mut stream = response.bytes_stream();
-    let mut data = Vec::new();
     let mut downloaded: u64 = 0;
+
+    let temp_name = format!(
+        ".vox-download-{}-{}.tar.bz2.partial",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let temp_path = dest_dir.join(temp_name);
+    let mut temp_file = tokio::fs::File::create(&temp_path).await?;
 
     use tokio_stream::StreamExt;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         downloaded += chunk.len() as u64;
-        data.extend_from_slice(&chunk);
+        temp_file.write_all(&chunk).await?;
         if let Some(total) = total {
             eprint!(
                 "\r  Progress: {:.1}%",
@@ -144,23 +155,36 @@ async fn download_and_extract_tar_bz2(url: &str, dest_dir: &Path) -> Result<()> 
         }
     }
     eprintln!();
+    temp_file.flush().await?;
 
-    // Extract tar.bz2 in a blocking task
+    // Extract tar.bz2 in a blocking task (stream from file, no giant in-memory buffer)
     let dest = dest_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || extract_tar_bz2(&data, &dest))
-        .await
-        .map_err(|e| VoiceError::Download(format!("Extract task failed: {e}")))?
+    let extract_path = temp_path.clone();
+    let extract_result =
+        tokio::task::spawn_blocking(move || extract_tar_bz2_file(&extract_path, &dest))
+            .await
+            .map_err(|e| VoiceError::Download(format!("Extract task failed: {e}")))?;
+
+    // Best-effort cleanup of temporary archive file
+    if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+        eprintln!(
+            "  Warning: failed to remove temp file {}: {e}",
+            temp_path.display()
+        );
+    }
+
+    extract_result
 }
 
-fn extract_tar_bz2(data: &[u8], dest_dir: &Path) -> Result<()> {
-    use std::io::Read;
-
+fn extract_tar_bz2_file(archive_path: &Path, dest_dir: &Path) -> Result<()> {
     eprintln!("  Extracting to {} ...", dest_dir.display());
 
-    let bz2_reader = bzip2::read::BzDecoder::new(data);
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| VoiceError::Download(format!("Failed to open archive: {e}")))?;
+    let bz2_reader = bzip2::read::BzDecoder::new(file);
     let mut archive = tar::Archive::new(bz2_reader);
 
-    // Check if entries can be read
+    // Stream extraction per-entry to keep memory usage low.
     for entry in archive
         .entries()
         .map_err(|e| VoiceError::Download(format!("Failed to read tar entries: {e}")))?
@@ -172,6 +196,14 @@ fn extract_tar_bz2(data: &[u8], dest_dir: &Path) -> Result<()> {
             .map_err(|e| VoiceError::Download(format!("Invalid path in tar: {e}")))?
             .to_path_buf();
 
+        // Prevent path traversal from archive entries.
+        if has_unsafe_archive_path(&path) {
+            return Err(VoiceError::Download(format!(
+                "Refusing to extract unsafe path: {}",
+                path.display()
+            )));
+        }
+
         let dest_path = dest_dir.join(&path);
 
         if entry.header().entry_type().is_dir() {
@@ -182,14 +214,9 @@ fn extract_tar_bz2(data: &[u8], dest_dir: &Path) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| VoiceError::Download(format!("Failed to create dir: {e}")))?;
             }
-            let mut file = std::fs::File::create(&dest_path)
-                .map_err(|e| VoiceError::Download(format!("Failed to create file: {e}")))?;
-            let mut buf = Vec::new();
             entry
-                .read_to_end(&mut buf)
-                .map_err(|e| VoiceError::Download(format!("Failed to read entry: {e}")))?;
-            std::io::Write::write_all(&mut file, &buf)
-                .map_err(|e| VoiceError::Download(format!("Failed to write file: {e}")))?;
+                .unpack(&dest_path)
+                .map_err(|e| VoiceError::Download(format!("Failed to unpack entry: {e}")))?;
         }
     }
 
@@ -197,10 +224,20 @@ fn extract_tar_bz2(data: &[u8], dest_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn has_unsafe_archive_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
 
     fn test_config(model_dir: &std::path::Path) -> Config {
         Config {
@@ -351,5 +388,41 @@ mod tests {
 
         assert!(models_ready_with_variant(&config, KokoroModel::Fp32V11));
         assert!(!models_ready_with_variant(&config, KokoroModel::Int8V11));
+    }
+
+    #[test]
+    fn extract_tar_bz2_file_extracts_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_path = tmp.path().join("test.tar.bz2");
+
+        let tar_bytes = {
+            let mut tar_builder = tar::Builder::new(Vec::<u8>::new());
+
+            let mut header = tar::Header::new_gnu();
+            header.set_path("foo/bar.txt").unwrap();
+            header.set_mode(0o644);
+            header.set_size(5);
+            header.set_cksum();
+            tar_builder.append(&header, b"hello" as &[u8]).unwrap();
+
+            tar_builder.into_inner().unwrap()
+        };
+
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+        encoder.write_all(&tar_bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+        fs::write(&archive_path, compressed).unwrap();
+
+        extract_tar_bz2_file(&archive_path, tmp.path()).unwrap();
+
+        let extracted = tmp.path().join("foo/bar.txt");
+        assert_eq!(fs::read_to_string(extracted).unwrap(), "hello");
+    }
+
+    #[test]
+    fn has_unsafe_archive_path_detects_parent_and_root_paths() {
+        assert!(has_unsafe_archive_path(Path::new("../evil.txt")));
+        assert!(has_unsafe_archive_path(Path::new("/absolute/path.txt")));
+        assert!(!has_unsafe_archive_path(Path::new("safe/relative/path.txt")));
     }
 }
