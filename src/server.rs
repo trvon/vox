@@ -12,6 +12,7 @@ use rmcp::task_manager::OperationProcessor;
 use rmcp::{ErrorData as McpError, ServerHandler, task_handler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -63,6 +64,28 @@ pub struct SayParams {
     #[serde(default = "default_speed")]
     pub speed: f32,
 }
+
+/// MCP tool parameters for the `enqueue_say` tool
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct EnqueueSayParams {
+    #[schemars(description = "Text to speak aloud")]
+    pub message: String,
+
+    #[schemars(description = "TTS voice name (e.g. af_heart, am_michael)")]
+    pub voice: Option<String>,
+
+    #[schemars(description = "Speech rate multiplier (default: 1.0)")]
+    #[serde(default = "default_speed")]
+    pub speed: f32,
+}
+
+/// MCP tool parameters for `tts_queue_status` (no params)
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct TtsQueueStatusParams {}
+
+/// MCP tool parameters for `tts_queue_clear` (no params)
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct TtsQueueClearParams {}
 
 /// MCP tool parameters for the `listen` tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -123,8 +146,107 @@ pub struct InboxMessage {
 }
 
 static CONVERSE_COUNTER: AtomicU64 = AtomicU64::new(1);
+static SAY_COUNTER: AtomicU64 = AtomicU64::new(1);
 const CONVERSE_AUTO_ASYNC_THRESHOLD_CHARS: usize = 600;
 const VAD_MAX_SPEECH_SECS: f32 = 86400.0; // effectively "no timeout"; safety cap for VAD internals
+
+#[derive(Debug, Clone)]
+struct QueuedSpeech {
+    id: String,
+    message: String,
+    voice: Option<String>,
+    speed: f32,
+    enqueued_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SpeechQueueItemInfo {
+    id: String,
+    message_chars: usize,
+    preview: String,
+    voice: Option<String>,
+    speed: f32,
+    enqueued_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TtsQueueStatus {
+    worker_active: bool,
+    currently_speaking: Option<SpeechQueueItemInfo>,
+    pending_count: usize,
+    pending: Vec<SpeechQueueItemInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TtsQueueClearResult {
+    cleared: usize,
+    pending_count: usize,
+    currently_speaking: bool,
+}
+
+impl QueuedSpeech {
+    fn info(&self) -> SpeechQueueItemInfo {
+        SpeechQueueItemInfo {
+            id: self.id.clone(),
+            message_chars: self.message.chars().count(),
+            preview: preview_text(&self.message),
+            voice: self.voice.clone(),
+            speed: self.speed,
+            enqueued_at: self.enqueued_at.clone(),
+        }
+    }
+}
+
+fn preview_text(text: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 80;
+    let mut preview = String::new();
+
+    for (i, ch) in text.chars().enumerate() {
+        if i >= MAX_PREVIEW_CHARS {
+            preview.push_str("...");
+            break;
+        }
+        preview.push(ch);
+    }
+
+    preview
+}
+
+fn queue_push(queue: &mut VecDeque<QueuedSpeech>, item: QueuedSpeech) -> usize {
+    queue.push_back(item);
+    queue.len()
+}
+
+fn queue_pop(queue: &mut VecDeque<QueuedSpeech>) -> Option<QueuedSpeech> {
+    queue.pop_front()
+}
+
+fn queue_status_snapshot(
+    worker_active: bool,
+    current: Option<&QueuedSpeech>,
+    queue: &VecDeque<QueuedSpeech>,
+) -> TtsQueueStatus {
+    let pending_items = queue.iter().map(QueuedSpeech::info).collect::<Vec<_>>();
+    TtsQueueStatus {
+        worker_active,
+        currently_speaking: current.map(QueuedSpeech::info),
+        pending_count: pending_items.len(),
+        pending: pending_items,
+    }
+}
+
+fn clear_pending_queue(
+    queue: &mut VecDeque<QueuedSpeech>,
+    currently_speaking: bool,
+) -> TtsQueueClearResult {
+    let cleared = queue.len();
+    queue.clear();
+    TtsQueueClearResult {
+        cleared,
+        pending_count: 0,
+        currently_speaking,
+    }
+}
 
 /// Simple ISO 8601 timestamp without a chrono dependency
 fn chrono_now() -> String {
@@ -169,6 +291,7 @@ fn default_converse_silence_timeout() -> u32 {
 pub struct VoiceMcpServer {
     tts: Arc<Mutex<TtsEngine>>,
     tts_swap_lock: Arc<TokioMutex<()>>,
+    tts_playback_lock: Arc<TokioMutex<()>>,
     stt: Arc<Mutex<SttEngine>>,
     config: SharedConfig,
     processor: Arc<TokioMutex<OperationProcessor>>,
@@ -176,6 +299,9 @@ pub struct VoiceMcpServer {
     inbox: Arc<Mutex<Vec<InboxMessage>>>,
     bg_capture: Arc<Mutex<Option<CaptureHandle>>>,
     bg_active: Arc<AtomicBool>,
+    tts_queue: Arc<TokioMutex<VecDeque<QueuedSpeech>>>,
+    tts_current: Arc<TokioMutex<Option<QueuedSpeech>>>,
+    tts_worker_active: Arc<AtomicBool>,
 }
 
 impl VoiceMcpServer {
@@ -193,6 +319,7 @@ impl VoiceMcpServer {
         Self {
             tts,
             tts_swap_lock: Arc::new(TokioMutex::new(())),
+            tts_playback_lock: Arc::new(TokioMutex::new(())),
             stt,
             config,
             processor: Arc::new(TokioMutex::new(OperationProcessor::new())),
@@ -200,6 +327,9 @@ impl VoiceMcpServer {
             inbox: Arc::new(Mutex::new(Vec::new())),
             bg_capture: Arc::new(Mutex::new(None)),
             bg_active: Arc::new(AtomicBool::new(false)),
+            tts_queue: Arc::new(TokioMutex::new(VecDeque::new())),
+            tts_current: Arc::new(TokioMutex::new(None)),
+            tts_worker_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -213,6 +343,7 @@ impl VoiceMcpServer {
         voice: Option<&str>,
         speed: Option<f32>,
     ) -> std::result::Result<(), String> {
+        let _playback_guard = self.tts_playback_lock.lock().await;
         self.ensure_tts_model_synced().await?;
 
         let config = self
@@ -278,6 +409,123 @@ impl VoiceMcpServer {
         );
 
         Ok(())
+    }
+
+    fn new_speech_id() -> String {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let n = SAY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("say-{now_ms}-{n}")
+    }
+
+    async fn enqueue_speech(
+        &self,
+        message: String,
+        voice: Option<String>,
+        speed: f32,
+    ) -> (String, usize) {
+        let id = Self::new_speech_id();
+        let queued = QueuedSpeech {
+            id: id.clone(),
+            message,
+            voice,
+            speed,
+            enqueued_at: chrono_now(),
+        };
+
+        let pending_count = {
+            let mut queue = self.tts_queue.lock().await;
+            queue_push(&mut queue, queued)
+        };
+
+        self.ensure_tts_queue_worker();
+        (id, pending_count)
+    }
+
+    fn ensure_tts_queue_worker(&self) {
+        if self
+            .tts_worker_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let server = self.clone();
+            tokio::spawn(async move {
+                server.run_tts_queue_worker().await;
+            });
+        }
+    }
+
+    async fn run_tts_queue_worker(self) {
+        loop {
+            let next = {
+                let mut queue = self.tts_queue.lock().await;
+                queue_pop(&mut queue)
+            };
+
+            let Some(item) = next else {
+                self.tts_worker_active.store(false, Ordering::Release);
+
+                let has_more = {
+                    let queue = self.tts_queue.lock().await;
+                    !queue.is_empty()
+                };
+
+                if has_more
+                    && self
+                        .tts_worker_active
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    continue;
+                }
+
+                break;
+            };
+
+            {
+                let mut current = self.tts_current.lock().await;
+                *current = Some(item.clone());
+            }
+
+            if let Err(e) = self
+                .speak(&item.message, item.voice.as_deref(), Some(item.speed))
+                .await
+            {
+                tracing::error!(speech_id = %item.id, "Queued speech failed: {e}");
+                let message = InboxMessage {
+                    text: format!("queued speech {} failed: {e}", item.id),
+                    timestamp: chrono_now(),
+                    source: Some("tts_queue".to_string()),
+                    conversation_id: None,
+                };
+                if let Ok(mut inbox) = self.inbox.lock() {
+                    inbox.push(message);
+                }
+            }
+
+            {
+                let mut current = self.tts_current.lock().await;
+                *current = None;
+            }
+        }
+    }
+
+    async fn tts_queue_status_snapshot(&self) -> TtsQueueStatus {
+        let current = { self.tts_current.lock().await.clone() };
+        let queue = self.tts_queue.lock().await;
+        queue_status_snapshot(
+            self.tts_worker_active.load(Ordering::Relaxed),
+            current.as_ref(),
+            &queue,
+        )
+    }
+
+    async fn clear_tts_queue(&self) -> TtsQueueClearResult {
+        let currently_speaking = self.tts_current.lock().await.is_some();
+        let mut queue = self.tts_queue.lock().await;
+        clear_pending_queue(&mut queue, currently_speaking)
     }
 
     async fn ensure_tts_model_synced(&self) -> std::result::Result<(), String> {
@@ -654,23 +902,74 @@ impl VoiceMcpServer {
 
     #[tool(
         name = "say",
-        description = "Speak a message aloud through the speakers. Use for announcements or one-way communication. Returns immediately while speech plays in the background."
+        description = "Queue a message to speak aloud through the speakers. Returns immediately after enqueuing."
     )]
     async fn say(
         &self,
         Parameters(params): Parameters<SayParams>,
     ) -> Result<CallToolResult, McpError> {
-        let server = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = server
-                .speak(&params.message, params.voice.as_deref(), Some(params.speed))
-                .await
-            {
-                tracing::error!("Background speak failed: {e}");
-            }
+        let (speech_id, pending_count) = self
+            .enqueue_speech(params.message, params.voice, params.speed)
+            .await;
+        let ack = serde_json::json!({
+            "status": "queued",
+            "speech_id": speech_id,
+            "pending_count": pending_count
         });
 
-        Ok(CallToolResult::success(vec![Content::text("Speaking...")]))
+        Ok(CallToolResult::success(vec![Content::text(
+            ack.to_string(),
+        )]))
+    }
+
+    #[tool(
+        name = "enqueue_say",
+        description = "Queue speech for ordered asynchronous playback. Returns a speech_id immediately."
+    )]
+    async fn enqueue_say(
+        &self,
+        Parameters(params): Parameters<EnqueueSayParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (speech_id, pending_count) = self
+            .enqueue_speech(params.message, params.voice, params.speed)
+            .await;
+        let ack = serde_json::json!({
+            "status": "queued",
+            "speech_id": speech_id,
+            "pending_count": pending_count
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            ack.to_string(),
+        )]))
+    }
+
+    #[tool(
+        name = "tts_queue_status",
+        description = "Get text-to-speech queue status, including current and pending items."
+    )]
+    async fn tts_queue_status(
+        &self,
+        Parameters(_params): Parameters<TtsQueueStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let status = self.tts_queue_status_snapshot().await;
+        let json = serde_json::to_string_pretty(&status)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "tts_queue_clear",
+        description = "Clear pending text-to-speech queue items. Does not interrupt currently playing audio."
+    )]
+    async fn tts_queue_clear(
+        &self,
+        Parameters(_params): Parameters<TtsQueueClearParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self.clear_tts_queue().await;
+        let json = serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(
@@ -994,7 +1293,8 @@ impl ServerHandler for VoiceMcpServer {
             server_info: rmcp::model::Implementation::from_build_env(),
             instructions: Some(
                 "Vox: voice MCP server with text-to-speech and speech-to-text. \
-                 Use 'say' to speak text aloud, 'listen' to capture and transcribe speech, \
+                 Use 'say' or 'enqueue_say' to queue speech, 'tts_queue_status' to inspect queue state, \
+                 'tts_queue_clear' to clear pending speech, 'listen' to capture and transcribe speech, \
                  or 'converse' for a speak-then-listen interaction."
                     .to_string(),
             ),
@@ -1005,6 +1305,16 @@ impl ServerHandler for VoiceMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queued(id: &str, message: &str) -> QueuedSpeech {
+        QueuedSpeech {
+            id: id.to_string(),
+            message: message.to_string(),
+            voice: Some("af_heart".to_string()),
+            speed: 1.0,
+            enqueued_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
 
     #[test]
     fn default_true_returns_true() {
@@ -1075,6 +1385,29 @@ mod tests {
         let params: SayParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.voice.as_deref(), Some("af_bella"));
         assert!((params.speed - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn enqueue_say_params_minimal() {
+        let json = serde_json::json!({
+            "message": "Queue this"
+        });
+        let params: EnqueueSayParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.message, "Queue this");
+        assert!(params.voice.is_none());
+        assert!((params.speed - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn enqueue_say_params_with_voice_and_speed() {
+        let json = serde_json::json!({
+            "message": "Queue",
+            "voice": "am_michael",
+            "speed": 1.25
+        });
+        let params: EnqueueSayParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.voice.as_deref(), Some("am_michael"));
+        assert!((params.speed - 1.25).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -1172,6 +1505,18 @@ mod tests {
     }
 
     #[test]
+    fn tts_queue_status_params_deserialize() {
+        let json = serde_json::json!({});
+        let _params: TtsQueueStatusParams = serde_json::from_value(json).unwrap();
+    }
+
+    #[test]
+    fn tts_queue_clear_params_deserialize() {
+        let json = serde_json::json!({});
+        let _params: TtsQueueClearParams = serde_json::from_value(json).unwrap();
+    }
+
+    #[test]
     fn calibrate_params_defaults() {
         let json = serde_json::json!({});
         let params: CalibrateParams = serde_json::from_value(json).unwrap();
@@ -1199,5 +1544,54 @@ mod tests {
         assert!(ts.ends_with('Z'));
         assert!(ts.contains('T'));
         assert_eq!(ts.len(), 20); // YYYY-MM-DDTHH:MM:SSZ
+    }
+
+    #[test]
+    fn preview_text_truncates_long_messages() {
+        let long = "a".repeat(90);
+        let preview = preview_text(&long);
+        assert_eq!(preview.len(), 83);
+        assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn queue_push_and_pop_preserve_fifo_order() {
+        let mut q = VecDeque::new();
+        assert_eq!(queue_push(&mut q, queued("one", "first")), 1);
+        assert_eq!(queue_push(&mut q, queued("two", "second")), 2);
+
+        let first = queue_pop(&mut q).unwrap();
+        let second = queue_pop(&mut q).unwrap();
+        assert_eq!(first.id, "one");
+        assert_eq!(second.id, "two");
+        assert!(queue_pop(&mut q).is_none());
+    }
+
+    #[test]
+    fn queue_status_snapshot_reports_current_and_pending() {
+        let mut q = VecDeque::new();
+        queue_push(&mut q, queued("one", "first message"));
+        queue_push(&mut q, queued("two", "second message"));
+        let current = queued("cur", "currently speaking");
+
+        let status = queue_status_snapshot(true, Some(&current), &q);
+        assert!(status.worker_active);
+        assert_eq!(status.pending_count, 2);
+        assert_eq!(status.pending.len(), 2);
+        assert_eq!(status.pending[0].id, "one");
+        assert_eq!(status.currently_speaking.unwrap().id, "cur");
+    }
+
+    #[test]
+    fn clear_pending_queue_clears_only_pending_items() {
+        let mut q = VecDeque::new();
+        queue_push(&mut q, queued("one", "first"));
+        queue_push(&mut q, queued("two", "second"));
+
+        let cleared = clear_pending_queue(&mut q, true);
+        assert_eq!(cleared.cleared, 2);
+        assert_eq!(cleared.pending_count, 0);
+        assert!(cleared.currently_speaking);
+        assert!(q.is_empty());
     }
 }
