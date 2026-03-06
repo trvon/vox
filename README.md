@@ -2,6 +2,8 @@
 
 Local voice MCP server with text-to-speech (Kokoro) and speech-to-text (Moonshine Base). All inference runs on-device — no API keys, no cloud.
 
+Default TTS model: `kokoro-int8-multi-lang-v1_1` (smaller footprint, good quality).
+
 ## Tools
 
 | Tool | Description |
@@ -62,6 +64,14 @@ cargo install --path .
 
 ```bash
 ./setup.sh
+```
+
+### Model download options
+
+```bash
+vox download-models                              # downloads configured kokoro_model
+vox download-models --kokoro-model int8-v1_1    # override to int8 for this run
+vox download-models --kokoro-model fp32-v1_1    # larger fp32 variant
 ```
 
 ## MCP Configuration
@@ -129,6 +139,7 @@ Settings are resolved in order: compiled defaults, then TOML file, then env vars
 | `VOX_VOICE` | `voice` | `af_heart` | Default TTS voice |
 | `VOX_SPEED` | `speed` | `1.4` | Speech rate multiplier |
 | `VOX_MODEL_DIR` | `model_dir` | `$XDG_DATA_HOME/vox/models` | Model storage path |
+| `VOX_KOKORO_MODEL` | `kokoro_model` | `int8-v1_1` | Kokoro model variant (`int8-v1_1` or `fp32-v1_1`) |
 | `VOX_LOG_LEVEL` | `log_level` | `info` | Log filter |
 | `VOX_PORT` | — | `3030` | Daemon mode port (env/CLI only) |
 
@@ -139,6 +150,7 @@ Manage config from the CLI:
 ```bash
 vox config get            # show all values
 vox config get voice      # show a single value
+vox config set kokoro_model fp32-v1_1
 vox config set speed 1.5  # persist to config.toml
 vox config path           # print config file location
 vox config reset-dsp      # reset DSP parameters to defaults

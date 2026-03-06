@@ -108,11 +108,7 @@ fn rejection_ratio(samples: &[f32]) -> f64 {
     let high = goertzel_magnitude(samples, 300.0, SAMPLE_RATE)
         + goertzel_magnitude(samples, 1000.0, SAMPLE_RATE)
         + goertzel_magnitude(samples, 3000.0, SAMPLE_RATE);
-    if high > 0.0 {
-        low / high
-    } else {
-        0.0
-    }
+    if high > 0.0 { low / high } else { 0.0 }
 }
 
 /// Speech band retention: energy at speech freqs before/after processing

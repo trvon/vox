@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, KokoroModel};
 use crate::error::{Result, VoiceError};
 use std::ffi::CString;
 use std::ptr::null;
@@ -44,6 +44,7 @@ pub struct TtsAudio {
 pub struct TtsEngine {
     tts: *const sherpa_rs_sys::SherpaOnnxOfflineTts,
     sample_rate: u32,
+    kokoro_model: KokoroModel,
     default_voice: String,
     default_speed: f32,
 }
@@ -67,7 +68,11 @@ impl TtsEngine {
             lexicon_parts.push(lexicon_zh.to_string_lossy().to_string());
         }
 
-        let model = cstring(&kokoro_dir.join("model.onnx").to_string_lossy());
+        let model = cstring(
+            &kokoro_dir
+                .join(config.kokoro_model.model_file_name())
+                .to_string_lossy(),
+        );
         let voices = cstring(&kokoro_dir.join("voices.bin").to_string_lossy());
         let tokens = cstring(&kokoro_dir.join("tokens.txt").to_string_lossy());
         let data_dir = cstring(&kokoro_dir.join("espeak-ng-data").to_string_lossy());
@@ -151,6 +156,7 @@ impl TtsEngine {
         Ok(Self {
             tts,
             sample_rate,
+            kokoro_model: config.kokoro_model,
             default_voice: config.voice.clone(),
             default_speed: config.speed,
         })
@@ -159,6 +165,10 @@ impl TtsEngine {
     /// Get the native sample rate of the TTS engine.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    pub fn kokoro_model(&self) -> KokoroModel {
+        self.kokoro_model
     }
 
     /// Synthesize text to audio samples (batch — waits for full synthesis).

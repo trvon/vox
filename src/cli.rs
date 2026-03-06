@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+use crate::config::KokoroModel;
+
 /// Lightweight voice MCP server with local Moonshine + Kokoro inference
 #[derive(Parser)]
 #[command(version, about)]
@@ -21,7 +23,11 @@ pub enum Command {
         action: ConfigAction,
     },
     /// Download models and exit
-    DownloadModels,
+    DownloadModels {
+        /// Kokoro model variant to download (defaults to configured kokoro_model)
+        #[arg(long, value_enum)]
+        kokoro_model: Option<KokoroModel>,
+    },
     /// Calibrate DSP parameters using a genetic algorithm on live audio
     Calibrate {
         /// Seconds of speech to record
@@ -46,12 +52,12 @@ pub enum Command {
 pub enum ConfigAction {
     /// Show a config value (or all values if no key given)
     Get {
-        /// Config key (e.g. voice, speed, model_dir, log_level)
+        /// Config key (e.g. voice, speed, model_dir, kokoro_model, log_level)
         key: Option<String>,
     },
     /// Set a config value
     Set {
-        /// Config key (e.g. voice, speed, model_dir, log_level)
+        /// Config key (e.g. voice, speed, model_dir, kokoro_model, log_level)
         key: String,
         /// Value to set
         value: String,
@@ -132,7 +138,22 @@ mod tests {
     #[test]
     fn parse_download_models() {
         let cli = Cli::try_parse_from(["vox", "download-models"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::DownloadModels)));
+        assert!(matches!(
+            cli.command,
+            Some(Command::DownloadModels { kokoro_model: None })
+        ));
+    }
+
+    #[test]
+    fn parse_download_models_with_variant() {
+        let cli =
+            Cli::try_parse_from(["vox", "download-models", "--kokoro-model", "fp32-v1_1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::DownloadModels {
+                kokoro_model: Some(KokoroModel::Fp32V11)
+            })
+        ));
     }
 
     #[test]

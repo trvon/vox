@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, KokoroModel};
 use crate::error::{Result, VoiceError};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
@@ -8,12 +8,25 @@ const VAD_URL: &str =
 
 const MOONSHINE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-int8.tar.bz2";
 
-const KOKORO_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2";
+const KOKORO_INT8_V1_1_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_1.tar.bz2";
+const KOKORO_FP32_V1_1_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_1.tar.bz2";
+
+fn kokoro_download_url(model: KokoroModel) -> &'static str {
+    match model {
+        KokoroModel::Int8V11 => KOKORO_INT8_V1_1_URL,
+        KokoroModel::Fp32V11 => KOKORO_FP32_V1_1_URL,
+    }
+}
 
 /// Check if all required models are present
 pub fn models_ready(config: &Config) -> bool {
+    models_ready_with_variant(config, config.kokoro_model)
+}
+
+/// Check if all required models are present for a selected Kokoro variant.
+pub fn models_ready_with_variant(config: &Config, kokoro_model: KokoroModel) -> bool {
     let moonshine_dir = config.moonshine_dir();
-    let kokoro_dir = config.kokoro_dir();
+    let kokoro_dir = config.model_dir.join(kokoro_model.model_dir_name());
     let vad_path = config.vad_model_path();
 
     vad_path.exists()
@@ -22,13 +35,21 @@ pub fn models_ready(config: &Config) -> bool {
         && moonshine_dir.join("uncached_decode.int8.onnx").exists()
         && moonshine_dir.join("cached_decode.int8.onnx").exists()
         && moonshine_dir.join("tokens.txt").exists()
-        && kokoro_dir.join("model.onnx").exists()
+        && kokoro_dir.join(kokoro_model.model_file_name()).exists()
         && kokoro_dir.join("voices.bin").exists()
         && kokoro_dir.join("tokens.txt").exists()
 }
 
 /// Download all required models
 pub async fn download_models(config: &Config) -> Result<()> {
+    download_models_with_variant(config, config.kokoro_model).await
+}
+
+/// Download all required models with a selected Kokoro variant.
+pub async fn download_models_with_variant(
+    config: &Config,
+    kokoro_model: KokoroModel,
+) -> Result<()> {
     std::fs::create_dir_all(&config.model_dir)
         .map_err(|e| VoiceError::Download(format!("Failed to create model dir: {e}")))?;
 
@@ -49,11 +70,11 @@ pub async fn download_models(config: &Config) -> Result<()> {
     }
 
     // Download Kokoro TTS model
-    let kokoro_dir = config.kokoro_dir();
-    if !kokoro_dir.join("model.onnx").exists() {
-        download_and_extract_tar_bz2(KOKORO_URL, &config.model_dir).await?;
+    let kokoro_dir = config.model_dir.join(kokoro_model.model_dir_name());
+    if !kokoro_dir.join(kokoro_model.model_file_name()).exists() {
+        download_and_extract_tar_bz2(kokoro_download_url(kokoro_model), &config.model_dir).await?;
     } else {
-        eprintln!("  Kokoro model already exists, skipping");
+        eprintln!("  Kokoro model ({kokoro_model}) already exists, skipping");
     }
 
     Ok(())
@@ -215,7 +236,7 @@ mod tests {
         // Create kokoro files
         let kokoro_dir = config.kokoro_dir();
         fs::create_dir_all(&kokoro_dir).unwrap();
-        fs::write(kokoro_dir.join("model.onnx"), b"dummy").unwrap();
+        fs::write(kokoro_dir.join("model.int8.onnx"), b"dummy").unwrap();
         fs::write(kokoro_dir.join("voices.bin"), b"dummy").unwrap();
         fs::write(kokoro_dir.join("tokens.txt"), b"dummy").unwrap();
 
@@ -238,7 +259,7 @@ mod tests {
 
         let kokoro_dir = config.kokoro_dir();
         fs::create_dir_all(&kokoro_dir).unwrap();
-        fs::write(kokoro_dir.join("model.onnx"), b"dummy").unwrap();
+        fs::write(kokoro_dir.join("model.int8.onnx"), b"dummy").unwrap();
         fs::write(kokoro_dir.join("voices.bin"), b"dummy").unwrap();
         fs::write(kokoro_dir.join("tokens.txt"), b"dummy").unwrap();
 
@@ -262,7 +283,7 @@ mod tests {
 
         let kokoro_dir = config.kokoro_dir();
         fs::create_dir_all(&kokoro_dir).unwrap();
-        fs::write(kokoro_dir.join("model.onnx"), b"dummy").unwrap();
+        fs::write(kokoro_dir.join("model.int8.onnx"), b"dummy").unwrap();
         fs::write(kokoro_dir.join("voices.bin"), b"dummy").unwrap();
         fs::write(kokoro_dir.join("tokens.txt"), b"dummy").unwrap();
 
@@ -286,7 +307,7 @@ mod tests {
 
         let kokoro_dir = config.kokoro_dir();
         fs::create_dir_all(&kokoro_dir).unwrap();
-        // Missing model.onnx
+        // Missing model.int8.onnx
         fs::write(kokoro_dir.join("voices.bin"), b"dummy").unwrap();
         fs::write(kokoro_dir.join("tokens.txt"), b"dummy").unwrap();
 
@@ -297,5 +318,38 @@ mod tests {
     fn moonshine_url_is_valid() {
         assert!(MOONSHINE_URL.starts_with("https://"));
         assert!(MOONSHINE_URL.contains("sherpa-onnx-moonshine-base-en-int8.tar.bz2"));
+    }
+
+    #[test]
+    fn kokoro_urls_are_valid() {
+        assert!(KOKORO_INT8_V1_1_URL.starts_with("https://"));
+        assert!(KOKORO_INT8_V1_1_URL.contains("kokoro-int8-multi-lang-v1_1.tar.bz2"));
+        assert!(KOKORO_FP32_V1_1_URL.starts_with("https://"));
+        assert!(KOKORO_FP32_V1_1_URL.contains("kokoro-multi-lang-v1_1.tar.bz2"));
+    }
+
+    #[test]
+    fn models_ready_with_fp32_variant_checks_fp32_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+
+        fs::write(config.vad_model_path(), b"dummy").unwrap();
+
+        let moonshine_dir = config.moonshine_dir();
+        fs::create_dir_all(&moonshine_dir).unwrap();
+        fs::write(moonshine_dir.join("preprocess.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("encode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("uncached_decode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("cached_decode.int8.onnx"), b"dummy").unwrap();
+        fs::write(moonshine_dir.join("tokens.txt"), b"dummy").unwrap();
+
+        let kokoro_dir = config.model_dir.join("kokoro-multi-lang-v1_1");
+        fs::create_dir_all(&kokoro_dir).unwrap();
+        fs::write(kokoro_dir.join("model.onnx"), b"dummy").unwrap();
+        fs::write(kokoro_dir.join("voices.bin"), b"dummy").unwrap();
+        fs::write(kokoro_dir.join("tokens.txt"), b"dummy").unwrap();
+
+        assert!(models_ready_with_variant(&config, KokoroModel::Fp32V11));
+        assert!(!models_ready_with_variant(&config, KokoroModel::Int8V11));
     }
 }

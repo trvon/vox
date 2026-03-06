@@ -68,7 +68,7 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
                     Some(val) => println!("{val}"),
                     None => {
                         eprintln!(
-                            "Unknown key: {key}\nValid keys: voice, speed, model_dir, log_level"
+                            "Unknown key: {key}\nValid keys: voice, speed, model_dir, kokoro_model, log_level"
                         );
                         std::process::exit(1);
                     }
@@ -99,9 +99,13 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
                 }
             }
         }
-        Some(Command::DownloadModels) => {
+        Some(Command::DownloadModels { kokoro_model }) => {
             eprintln!("Downloading models...");
-            models::download_models(&config).await?;
+            models::download_models_with_variant(
+                &config,
+                kokoro_model.unwrap_or(config.kokoro_model),
+            )
+            .await?;
             eprintln!("All models downloaded successfully.");
         }
         Some(Command::Calibrate {

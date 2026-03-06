@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
 const APP_NAME: &str = "vox";
@@ -27,10 +28,65 @@ impl Default for DspConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq, clap::ValueEnum, Default)]
+pub enum KokoroModel {
+    #[serde(rename = "int8-v1_1")]
+    #[value(name = "int8-v1_1")]
+    #[default]
+    Int8V11,
+    #[serde(rename = "fp32-v1_1")]
+    #[value(name = "fp32-v1_1")]
+    Fp32V11,
+}
+
+impl KokoroModel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Int8V11 => "int8-v1_1",
+            Self::Fp32V11 => "fp32-v1_1",
+        }
+    }
+
+    pub fn model_dir_name(self) -> &'static str {
+        match self {
+            Self::Int8V11 => "kokoro-int8-multi-lang-v1_1",
+            Self::Fp32V11 => "kokoro-multi-lang-v1_1",
+        }
+    }
+
+    pub fn model_file_name(self) -> &'static str {
+        match self {
+            Self::Int8V11 => "model.int8.onnx",
+            Self::Fp32V11 => "model.onnx",
+        }
+    }
+}
+
+impl std::fmt::Display for KokoroModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for KokoroModel {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "int8-v1_1" | "int8" => Ok(Self::Int8V11),
+            "fp32-v1_1" | "fp32" => Ok(Self::Fp32V11),
+            other => Err(format!(
+                "Invalid kokoro_model: {other}. Valid values: int8-v1_1, fp32-v1_1"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct Config {
     pub model_dir: PathBuf,
+    pub kokoro_model: KokoroModel,
     pub voice: String,
     pub speed: f32,
     pub log_level: String,
@@ -42,6 +98,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             model_dir: default_model_dir(),
+            kokoro_model: KokoroModel::Int8V11,
             voice: "af_heart".to_string(),
             speed: 1.4,
             log_level: "info".to_string(),
@@ -116,6 +173,16 @@ impl Config {
         if let Ok(val) = std::env::var("VOX_MODEL_DIR") {
             config.model_dir = PathBuf::from(val);
         }
+        if let Ok(val) = std::env::var("VOX_KOKORO_MODEL") {
+            match val.parse::<KokoroModel>() {
+                Ok(model) => {
+                    config.kokoro_model = model;
+                }
+                Err(e) => {
+                    tracing::warn!("{e}");
+                }
+            }
+        }
         if let Ok(val) = std::env::var("VOX_VOICE") {
             config.voice = val;
         }
@@ -169,6 +236,7 @@ impl Config {
             "voice" => Some(self.voice.clone()),
             "speed" => Some(self.speed.to_string()),
             "model_dir" => Some(self.model_dir.to_string_lossy().to_string()),
+            "kokoro_model" => Some(self.kokoro_model.to_string()),
             "log_level" => Some(self.log_level.clone()),
             "dsp.hpf_cutoff_hz" => Some(self.dsp.hpf_cutoff_hz.to_string()),
             "dsp.noise_gate_rms" => Some(self.dsp.noise_gate_rms.to_string()),
@@ -206,6 +274,10 @@ impl Config {
             }
             "model_dir" => {
                 table.insert(key.to_string(), toml::Value::String(value.to_string()));
+            }
+            "kokoro_model" => {
+                let model = value.parse::<KokoroModel>()?;
+                table.insert(key.to_string(), toml::Value::String(model.to_string()));
             }
             "log_level" => {
                 table.insert(key.to_string(), toml::Value::String(value.to_string()));
@@ -253,7 +325,7 @@ impl Config {
             }
             _ => {
                 return Err(format!(
-                    "Unknown config key: {key}\nValid keys: voice, speed, model_dir, log_level, dsp.hpf_cutoff_hz, dsp.noise_gate_rms, dsp.noise_gate_window, dsp.normalize_threshold"
+                    "Unknown config key: {key}\nValid keys: voice, speed, model_dir, kokoro_model, log_level, dsp.hpf_cutoff_hz, dsp.noise_gate_rms, dsp.noise_gate_window, dsp.normalize_threshold"
                 ));
             }
         }
@@ -291,10 +363,11 @@ impl Config {
     /// Display all config values
     pub fn display_all(&self) -> String {
         format!(
-            "voice = \"{}\"\nspeed = {}\nmodel_dir = \"{}\"\nlog_level = \"{}\"\n\n[dsp]\nhpf_cutoff_hz = {}\nnoise_gate_rms = {}\nnoise_gate_window = {}\nnormalize_threshold = {}",
+            "voice = \"{}\"\nspeed = {}\nmodel_dir = \"{}\"\nkokoro_model = \"{}\"\nlog_level = \"{}\"\n\n[dsp]\nhpf_cutoff_hz = {}\nnoise_gate_rms = {}\nnoise_gate_window = {}\nnormalize_threshold = {}",
             self.voice,
             self.speed,
             self.model_dir.display(),
+            self.kokoro_model,
             self.log_level,
             self.dsp.hpf_cutoff_hz,
             self.dsp.noise_gate_rms,
@@ -310,7 +383,7 @@ impl Config {
 
     /// Resolve path for the kokoro model directory
     pub fn kokoro_dir(&self) -> PathBuf {
-        self.model_dir.join("kokoro-multi-lang-v1_0")
+        self.model_dir.join(self.kokoro_model.model_dir_name())
     }
 
     /// Resolve path for the VAD model
@@ -393,6 +466,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.voice, "af_heart");
         assert!((config.speed - 1.4).abs() < f32::EPSILON);
+        assert_eq!(config.kokoro_model, KokoroModel::Int8V11);
         assert_eq!(config.log_level, "info");
     }
 
@@ -413,8 +487,9 @@ mod tests {
         let config = Config::default();
         let dir = config.kokoro_dir();
         assert!(
-            dir.to_string_lossy().ends_with("kokoro-multi-lang-v1_0"),
-            "kokoro_dir should end with kokoro-multi-lang-v1_0, got: {}",
+            dir.to_string_lossy()
+                .ends_with("kokoro-int8-multi-lang-v1_1"),
+            "kokoro_dir should end with kokoro-int8-multi-lang-v1_1, got: {}",
             dir.display()
         );
     }
@@ -439,6 +514,7 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.voice, "am_michael");
         assert!((config.speed - 1.5).abs() < f32::EPSILON);
+        assert_eq!(config.kokoro_model, KokoroModel::Int8V11);
         assert_eq!(config.log_level, "info");
     }
 
@@ -465,6 +541,19 @@ mod tests {
         assert!(config.moonshine_dir().starts_with("/tmp/vox-models"));
         assert!(config.kokoro_dir().starts_with("/tmp/vox-models"));
         assert!(config.vad_model_path().starts_with("/tmp/vox-models"));
+    }
+
+    #[test]
+    fn toml_kokoro_model_variant_parses() {
+        let toml_str = r#"kokoro_model = "fp32-v1_1""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.kokoro_model, KokoroModel::Fp32V11);
+        assert!(
+            config
+                .kokoro_dir()
+                .to_string_lossy()
+                .ends_with("kokoro-multi-lang-v1_1")
+        );
     }
 
     // --- DspConfig tests ---
@@ -506,6 +595,7 @@ mod tests {
     #[test]
     fn get_value_dsp_keys() {
         let config = Config::default();
+        assert_eq!(config.get_value("kokoro_model").unwrap(), "int8-v1_1");
         assert_eq!(config.get_value("dsp.hpf_cutoff_hz").unwrap(), "200");
         assert_eq!(config.get_value("dsp.noise_gate_rms").unwrap(), "0.01");
         assert_eq!(config.get_value("dsp.noise_gate_window").unwrap(), "512");

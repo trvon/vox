@@ -1,5 +1,6 @@
 use crate::audio::{self, CaptureHandle};
 use crate::config::{Config, SharedConfig};
+use crate::models;
 use crate::stt::SttEngine;
 use crate::tts::TtsEngine;
 use crate::vad::VadSession;
@@ -11,9 +12,9 @@ use rmcp::task_manager::OperationProcessor;
 use rmcp::{ErrorData as McpError, ServerHandler, task_handler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicU64;
 use tokio::sync::Mutex as TokioMutex;
 
 /// MCP tool parameters for the `converse` tool
@@ -33,14 +34,18 @@ pub struct ConverseParams {
     #[serde(default = "default_speed")]
     pub speed: f32,
 
-    #[schemars(description = "Silence duration in ms before end-of-turn (default: 2500 for converse)")]
+    #[schemars(
+        description = "Silence duration in ms before end-of-turn (default: 2500 for converse)"
+    )]
     #[serde(default = "default_converse_silence_timeout")]
     pub silence_timeout_ms: u32,
 
     #[schemars(description = "Minimum speech duration in ms before accepting silence as end")]
     pub min_speech_ms: Option<u32>,
 
-    #[schemars(description = "If true, return immediately and deliver the transcription via check_inbox")]
+    #[schemars(
+        description = "If true, return immediately and deliver the transcription via check_inbox"
+    )]
     #[serde(default)]
     pub async_mode: Option<bool>,
 }
@@ -163,6 +168,7 @@ fn default_converse_silence_timeout() -> u32 {
 #[derive(Clone)]
 pub struct VoiceMcpServer {
     tts: Arc<Mutex<TtsEngine>>,
+    tts_swap_lock: Arc<TokioMutex<()>>,
     stt: Arc<Mutex<SttEngine>>,
     config: SharedConfig,
     processor: Arc<TokioMutex<OperationProcessor>>,
@@ -186,6 +192,7 @@ impl VoiceMcpServer {
     ) -> Self {
         Self {
             tts,
+            tts_swap_lock: Arc::new(TokioMutex::new(())),
             stt,
             config,
             processor: Arc::new(TokioMutex::new(OperationProcessor::new())),
@@ -206,10 +213,18 @@ impl VoiceMcpServer {
         voice: Option<&str>,
         speed: Option<f32>,
     ) -> std::result::Result<(), String> {
+        self.ensure_tts_model_synced().await?;
+
+        let config = self
+            .config
+            .read()
+            .map_err(|e| format!("Config lock poisoned: {e}"))?
+            .clone();
+        let selected_voice = voice.unwrap_or(&config.voice).to_string();
+        let selected_speed = speed.unwrap_or(config.speed);
+
         let tts = self.tts.clone();
         let text = text.to_string();
-        let voice = voice.map(|v| v.to_string());
-        let speed = speed.unwrap_or(1.0);
 
         let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<f32>>();
 
@@ -222,7 +237,11 @@ impl VoiceMcpServer {
         // Use sentence-first streaming for long text to minimize latency
         const SENTENCE_STREAMING_THRESHOLD: usize = 150;
         let use_sentence_streaming = text.len() >= SENTENCE_STREAMING_THRESHOLD
-            && text.chars().filter(|&c| c == '.' || c == '!' || c == '?').count() >= 2;
+            && text
+                .chars()
+                .filter(|&c| c == '.' || c == '!' || c == '?')
+                .count()
+                >= 2;
 
         let t_start = std::time::Instant::now();
         let text_len_for_log = text.len();
@@ -230,14 +249,14 @@ impl VoiceMcpServer {
         // Producer: streaming TTS synthesis (blocking, callback pushes chunks)
         let producer = tokio::task::spawn_blocking(move || {
             let mut tts = tts.lock().map_err(|e| format!("TTS lock: {e}"))?;
-            let sid = crate::tts::resolve_voice_id(voice.as_deref().unwrap_or("af_heart"));
+            let sid = crate::tts::resolve_voice_id(&selected_voice);
 
             if use_sentence_streaming {
                 tracing::debug!("Using sentence-first streaming for low latency");
-                tts.synthesize_sentences_streaming(&text, sid, speed, std_tx)
+                tts.synthesize_sentences_streaming(&text, sid, selected_speed, std_tx)
                     .map_err(|e| format!("TTS failed: {e}"))
             } else {
-                tts.synthesize_streaming(&text, sid, speed, std_tx)
+                tts.synthesize_streaming(&text, sid, selected_speed, std_tx)
                     .map_err(|e| format!("TTS failed: {e}"))
             }
         });
@@ -258,6 +277,55 @@ impl VoiceMcpServer {
             "TTS streaming complete"
         );
 
+        Ok(())
+    }
+
+    async fn ensure_tts_model_synced(&self) -> std::result::Result<(), String> {
+        let config = self
+            .config
+            .read()
+            .map_err(|e| format!("Config lock poisoned: {e}"))?
+            .clone();
+        let desired_model = config.kokoro_model;
+
+        let current_model = {
+            let tts = self.tts.lock().map_err(|e| format!("TTS lock: {e}"))?;
+            tts.kokoro_model()
+        };
+        if current_model == desired_model {
+            return Ok(());
+        }
+
+        let _guard = self.tts_swap_lock.lock().await;
+
+        let current_model = {
+            let tts = self.tts.lock().map_err(|e| format!("TTS lock: {e}"))?;
+            tts.kokoro_model()
+        };
+        if current_model == desired_model {
+            return Ok(());
+        }
+
+        tracing::info!(
+            current = %current_model,
+            target = %desired_model,
+            "Kokoro model changed in config, preparing swap"
+        );
+
+        models::download_models_with_variant(&config, desired_model)
+            .await
+            .map_err(|e| format!("Model download failed: {e}"))?;
+
+        let config_for_init = config.clone();
+        let new_tts = tokio::task::spawn_blocking(move || TtsEngine::new(&config_for_init))
+            .await
+            .map_err(|e| format!("TTS init task failed: {e}"))?
+            .map_err(|e| format!("TTS init failed: {e}"))?;
+
+        let mut tts = self.tts.lock().map_err(|e| format!("TTS lock: {e}"))?;
+        *tts = new_tts;
+
+        tracing::info!(model = %desired_model, "Kokoro model swap complete");
         Ok(())
     }
 
@@ -381,7 +449,8 @@ impl VoiceMcpServer {
                                         pending_end_time = Some(std::time::Instant::now());
                                         tracing::debug!(
                                             silence_elapsed_ms = silence_elapsed.as_millis() as u64,
-                                            effective_threshold_ms = effective_threshold.as_millis() as u64,
+                                            effective_threshold_ms =
+                                                effective_threshold.as_millis() as u64,
                                             "Silence threshold reached, starting grace window"
                                         );
                                     }
@@ -390,7 +459,8 @@ impl VoiceMcpServer {
                                             >= std::time::Duration::from_millis(GRACE_WINDOW_MS)
                                         {
                                             tracing::debug!(
-                                                total_speech_duration_ms = total_speech_duration.as_millis() as u64,
+                                                total_speech_duration_ms =
+                                                    total_speech_duration.as_millis() as u64,
                                                 grace_window_ms = GRACE_WINDOW_MS,
                                                 "Grace window expired, confirming end-of-turn"
                                             );
@@ -555,7 +625,9 @@ impl VoiceMcpServer {
                 "conversation_id": conversation_id_for_ack,
                 "delivery": "check_inbox"
             });
-            return Ok(CallToolResult::success(vec![Content::text(ack.to_string())]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                ack.to_string(),
+            )]));
         }
 
         self.speak(&params.message, params.voice.as_deref(), Some(params.speed))
@@ -719,16 +791,16 @@ impl VoiceMcpServer {
                                 match stt.transcribe(16000, &samples) {
                                     Ok(text) => {
                                         if !text.is_empty() && text != "(no speech detected)" {
-                                             let msg = InboxMessage {
-                                                 text,
-                                                 timestamp: chrono_now(),
-                                                 source: Some("background_listening".to_string()),
-                                                 conversation_id: None,
-                                             };
-                                             if let Ok(mut inbox) = inbox_clone.lock() {
-                                                 inbox.push(msg);
-                                             }
-                                         }
+                                            let msg = InboxMessage {
+                                                text,
+                                                timestamp: chrono_now(),
+                                                source: Some("background_listening".to_string()),
+                                                conversation_id: None,
+                                            };
+                                            if let Ok(mut inbox) = inbox_clone.lock() {
+                                                inbox.push(msg);
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::error!("Background STT failed: {e}");
@@ -840,6 +912,9 @@ impl VoiceMcpServer {
         Parameters(_params): Parameters<ReloadConfigParams>,
     ) -> Result<CallToolResult, McpError> {
         Config::reload_into(&self.config).map_err(|e| McpError::internal_error(e, None))?;
+        self.ensure_tts_model_synced()
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
         let config = self.config.read().unwrap();
         let msg = format!("Config reloaded:\n\n{}", config.display_all());
         Ok(CallToolResult::success(vec![Content::text(msg)]))
