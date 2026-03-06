@@ -423,6 +423,8 @@ mod tests {
     fn has_unsafe_archive_path_detects_parent_and_root_paths() {
         assert!(has_unsafe_archive_path(Path::new("../evil.txt")));
         assert!(has_unsafe_archive_path(Path::new("/absolute/path.txt")));
-        assert!(!has_unsafe_archive_path(Path::new("safe/relative/path.txt")));
+        assert!(!has_unsafe_archive_path(Path::new(
+            "safe/relative/path.txt"
+        )));
     }
 }

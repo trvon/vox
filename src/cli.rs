@@ -12,6 +12,14 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Call Vox daemon tools over HTTP and print JSON
+    Tool {
+        /// Override daemon MCP URL (default: running daemon port or http://127.0.0.1:3030/mcp)
+        #[arg(long)]
+        url: Option<String>,
+        #[command(subcommand)]
+        action: ToolAction,
+    },
     /// Manage the HTTP daemon
     Daemon {
         #[command(subcommand)]
@@ -45,6 +53,93 @@ pub enum Command {
         /// Print results without saving to config
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ToolAction {
+    /// Queue a message to speak aloud
+    Say {
+        /// Text to speak aloud
+        #[arg(long)]
+        message: String,
+        /// TTS voice name (e.g. af_heart, am_michael)
+        #[arg(long)]
+        voice: Option<String>,
+        /// Speech rate multiplier
+        #[arg(long, default_value = "1.0")]
+        speed: f32,
+    },
+    /// Queue speech for ordered asynchronous playback
+    EnqueueSay {
+        /// Text to speak aloud
+        #[arg(long)]
+        message: String,
+        /// TTS voice name (e.g. af_heart, am_michael)
+        #[arg(long)]
+        voice: Option<String>,
+        /// Speech rate multiplier
+        #[arg(long, default_value = "1.0")]
+        speed: f32,
+    },
+    /// Get current and pending TTS queue state
+    TtsQueueStatus,
+    /// Clear pending TTS queue items
+    TtsQueueClear,
+    /// Record speech from microphone and transcribe it
+    Listen {
+        /// Minimum speech duration in ms before accepting silence as end
+        #[arg(long)]
+        min_speech_ms: Option<u32>,
+        /// Silence duration in ms before end-of-turn
+        #[arg(long, default_value = "1500")]
+        silence_timeout_ms: u32,
+    },
+    /// Start background listening
+    StartListening,
+    /// Drain background listening inbox
+    CheckInbox,
+    /// Stop background listening and return remaining messages
+    StopListening,
+    /// Reset DSP parameters to defaults
+    ResetDsp,
+    /// Reload config from disk
+    ReloadConfig,
+    /// Speak and optionally listen for a response
+    Converse {
+        /// Text to speak aloud before listening
+        #[arg(long)]
+        message: String,
+        /// TTS voice name (e.g. af_heart, am_michael)
+        #[arg(long)]
+        voice: Option<String>,
+        /// Speech rate multiplier
+        #[arg(long, default_value = "1.0")]
+        speed: f32,
+        /// Listen for user speech after speaking
+        #[arg(long, default_value_t = true)]
+        wait_for_response: bool,
+        /// Return immediately and deliver response via check_inbox
+        #[arg(long)]
+        async_mode: bool,
+        /// Minimum speech duration in ms before accepting silence as end
+        #[arg(long)]
+        min_speech_ms: Option<u32>,
+        /// Silence duration in ms before end-of-turn
+        #[arg(long, default_value = "2500")]
+        silence_timeout_ms: u32,
+    },
+    /// Run DSP calibration via the daemon
+    Calibrate {
+        /// Record speech duration in seconds
+        #[arg(long)]
+        speech_secs: Option<u32>,
+        /// Record silence duration in seconds
+        #[arg(long)]
+        silence_secs: Option<u32>,
+        /// Persist calibration instead of dry-run preview
+        #[arg(long)]
+        save: bool,
     },
 }
 
@@ -105,6 +200,60 @@ mod tests {
     fn parse_no_args() {
         let cli = Cli::try_parse_from(["vox"]).unwrap();
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parse_tool_say() {
+        let cli = Cli::try_parse_from(["vox", "tool", "say", "--message", "hello"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Tool {
+                action: ToolAction::Say { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_tool_converse_async() {
+        let cli = Cli::try_parse_from([
+            "vox",
+            "tool",
+            "converse",
+            "--message",
+            "hello",
+            "--async-mode",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Tool {
+                action: ToolAction::Converse {
+                    async_mode: true,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_tool_with_custom_url() {
+        let cli = Cli::try_parse_from([
+            "vox",
+            "tool",
+            "--url",
+            "http://127.0.0.1:4040/mcp",
+            "tts-queue-status",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Tool {
+                url: Some(_),
+                action: ToolAction::TtsQueueStatus,
+            })
+        ));
     }
 
     #[test]

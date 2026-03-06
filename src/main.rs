@@ -8,13 +8,15 @@ mod config;
 mod daemon;
 mod error;
 mod models;
+mod runtime;
 mod server;
 mod stt;
+mod tool_client;
 mod tts;
 mod vad;
 
 use clap::Parser;
-use cli::{Cli, Command, ConfigAction, DaemonAction};
+use cli::{Cli, Command, ConfigAction, DaemonAction, ToolAction};
 use config::Config;
 use rmcp::ServiceExt;
 
@@ -108,6 +110,18 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
             .await?;
             eprintln!("All models downloaded successfully.");
         }
+        Some(Command::Tool { url, action }) => {
+            let tool_name = tool_action_name(&action);
+            let result = match handle_tool_command(url.as_deref(), action).await {
+                Ok(ok) => tool_client::print_success(&ok),
+                Err(err) => {
+                    let cli_err = tool_client::map_error(tool_name, &err);
+                    tool_client::print_error(&cli_err)?;
+                    std::process::exit(1);
+                }
+            };
+            result?;
+        }
         Some(Command::Calibrate {
             speech_secs,
             silence_secs,
@@ -172,6 +186,109 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
     Ok(())
 }
 
+async fn handle_tool_command(
+    url: Option<&str>,
+    action: ToolAction,
+) -> eyre::Result<tool_client::CliSuccess> {
+    let (tool_name, args) = tool_action_request(&action);
+    tool_client::call_tool(url, tool_name, args).await
+}
+
+fn tool_action_name(action: &ToolAction) -> &'static str {
+    match action {
+        ToolAction::Say { .. } => "say",
+        ToolAction::EnqueueSay { .. } => "enqueue_say",
+        ToolAction::TtsQueueStatus => "tts_queue_status",
+        ToolAction::TtsQueueClear => "tts_queue_clear",
+        ToolAction::Listen { .. } => "listen",
+        ToolAction::StartListening => "start_listening",
+        ToolAction::CheckInbox => "check_inbox",
+        ToolAction::StopListening => "stop_listening",
+        ToolAction::ResetDsp => "reset_dsp",
+        ToolAction::ReloadConfig => "reload_config",
+        ToolAction::Converse { .. } => "converse",
+        ToolAction::Calibrate { .. } => "calibrate",
+    }
+}
+
+fn tool_action_request(action: &ToolAction) -> (&'static str, serde_json::Value) {
+    match action {
+        ToolAction::Say {
+            message,
+            voice,
+            speed,
+        } => (
+            "say",
+            serde_json::json!({
+                "message": message,
+                "voice": voice,
+                "speed": speed,
+            }),
+        ),
+        ToolAction::EnqueueSay {
+            message,
+            voice,
+            speed,
+        } => (
+            "enqueue_say",
+            serde_json::json!({
+                "message": message,
+                "voice": voice,
+                "speed": speed,
+            }),
+        ),
+        ToolAction::TtsQueueStatus => ("tts_queue_status", serde_json::json!({})),
+        ToolAction::TtsQueueClear => ("tts_queue_clear", serde_json::json!({})),
+        ToolAction::Listen {
+            min_speech_ms,
+            silence_timeout_ms,
+        } => (
+            "listen",
+            serde_json::json!({
+                "min_speech_ms": min_speech_ms,
+                "silence_timeout_ms": silence_timeout_ms,
+            }),
+        ),
+        ToolAction::StartListening => ("start_listening", serde_json::json!({})),
+        ToolAction::CheckInbox => ("check_inbox", serde_json::json!({})),
+        ToolAction::StopListening => ("stop_listening", serde_json::json!({})),
+        ToolAction::ResetDsp => ("reset_dsp", serde_json::json!({})),
+        ToolAction::ReloadConfig => ("reload_config", serde_json::json!({})),
+        ToolAction::Converse {
+            message,
+            voice,
+            speed,
+            wait_for_response,
+            async_mode,
+            min_speech_ms,
+            silence_timeout_ms,
+        } => (
+            "converse",
+            serde_json::json!({
+                "message": message,
+                "voice": voice,
+                "speed": speed,
+                "wait_for_response": wait_for_response,
+                "async_mode": async_mode,
+                "min_speech_ms": min_speech_ms,
+                "silence_timeout_ms": silence_timeout_ms,
+            }),
+        ),
+        ToolAction::Calibrate {
+            speech_secs,
+            silence_secs,
+            save,
+        } => (
+            "calibrate",
+            serde_json::json!({
+                "speech_secs": speech_secs,
+                "silence_secs": silence_secs,
+                "dry_run": !save,
+            }),
+        ),
+    }
+}
+
 /// Download models if they aren't already present.
 async fn ensure_models(config: &Config) -> eyre::Result<()> {
     if !models::models_ready(config) {
@@ -220,4 +337,47 @@ async fn run_stdio(tts: tts::TtsEngine, stt: stt::SttEngine, config: Config) -> 
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_action_request_maps_say_arguments() {
+        let action = ToolAction::Say {
+            message: "hello".to_string(),
+            voice: Some("af_heart".to_string()),
+            speed: 1.2,
+        };
+        let (tool, args) = tool_action_request(&action);
+        assert_eq!(tool, "say");
+        assert_eq!(args["message"], "hello");
+        assert_eq!(args["voice"], "af_heart");
+        assert!((args["speed"].as_f64().unwrap() - 1.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tool_action_request_maps_calibrate_save_to_dry_run_false() {
+        let action = ToolAction::Calibrate {
+            speech_secs: Some(10),
+            silence_secs: Some(5),
+            save: true,
+        };
+        let (tool, args) = tool_action_request(&action);
+        assert_eq!(tool, "calibrate");
+        assert_eq!(args["dry_run"], false);
+    }
+
+    #[test]
+    fn tool_action_name_matches_queue_tools() {
+        assert_eq!(
+            tool_action_name(&ToolAction::TtsQueueStatus),
+            "tts_queue_status"
+        );
+        assert_eq!(
+            tool_action_name(&ToolAction::TtsQueueClear),
+            "tts_queue_clear"
+        );
+    }
 }

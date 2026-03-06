@@ -1,9 +1,7 @@
-use crate::audio::{self, CaptureHandle};
-use crate::config::{Config, SharedConfig};
-use crate::models;
+use crate::config::SharedConfig;
+use crate::runtime::{InboxMessage, VoiceRuntime, chrono_now};
 use crate::stt::SttEngine;
 use crate::tts::TtsEngine;
-use crate::vad::VadSession;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -12,10 +10,10 @@ use rmcp::task_manager::OperationProcessor;
 use rmcp::{ErrorData as McpError, ServerHandler, task_handler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex as TokioMutex;
 
 /// MCP tool parameters for the `converse` tool
@@ -132,144 +130,8 @@ pub struct CalibrateParams {
     pub silence_secs: Option<u32>,
 }
 
-/// A transcribed message from the background listener
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InboxMessage {
-    pub text: String,
-    pub timestamp: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<String>,
-}
-
 static CONVERSE_COUNTER: AtomicU64 = AtomicU64::new(1);
-static SAY_COUNTER: AtomicU64 = AtomicU64::new(1);
 const CONVERSE_AUTO_ASYNC_THRESHOLD_CHARS: usize = 600;
-const VAD_MAX_SPEECH_SECS: f32 = 86400.0; // effectively "no timeout"; safety cap for VAD internals
-
-#[derive(Debug, Clone)]
-struct QueuedSpeech {
-    id: String,
-    message: String,
-    voice: Option<String>,
-    speed: f32,
-    enqueued_at: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SpeechQueueItemInfo {
-    id: String,
-    message_chars: usize,
-    preview: String,
-    voice: Option<String>,
-    speed: f32,
-    enqueued_at: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct TtsQueueStatus {
-    worker_active: bool,
-    currently_speaking: Option<SpeechQueueItemInfo>,
-    pending_count: usize,
-    pending: Vec<SpeechQueueItemInfo>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct TtsQueueClearResult {
-    cleared: usize,
-    pending_count: usize,
-    currently_speaking: bool,
-}
-
-impl QueuedSpeech {
-    fn info(&self) -> SpeechQueueItemInfo {
-        SpeechQueueItemInfo {
-            id: self.id.clone(),
-            message_chars: self.message.chars().count(),
-            preview: preview_text(&self.message),
-            voice: self.voice.clone(),
-            speed: self.speed,
-            enqueued_at: self.enqueued_at.clone(),
-        }
-    }
-}
-
-fn preview_text(text: &str) -> String {
-    const MAX_PREVIEW_CHARS: usize = 80;
-    let mut preview = String::new();
-
-    for (i, ch) in text.chars().enumerate() {
-        if i >= MAX_PREVIEW_CHARS {
-            preview.push_str("...");
-            break;
-        }
-        preview.push(ch);
-    }
-
-    preview
-}
-
-fn queue_push(queue: &mut VecDeque<QueuedSpeech>, item: QueuedSpeech) -> usize {
-    queue.push_back(item);
-    queue.len()
-}
-
-fn queue_pop(queue: &mut VecDeque<QueuedSpeech>) -> Option<QueuedSpeech> {
-    queue.pop_front()
-}
-
-fn queue_status_snapshot(
-    worker_active: bool,
-    current: Option<&QueuedSpeech>,
-    queue: &VecDeque<QueuedSpeech>,
-) -> TtsQueueStatus {
-    let pending_items = queue.iter().map(QueuedSpeech::info).collect::<Vec<_>>();
-    TtsQueueStatus {
-        worker_active,
-        currently_speaking: current.map(QueuedSpeech::info),
-        pending_count: pending_items.len(),
-        pending: pending_items,
-    }
-}
-
-fn clear_pending_queue(
-    queue: &mut VecDeque<QueuedSpeech>,
-    currently_speaking: bool,
-) -> TtsQueueClearResult {
-    let cleared = queue.len();
-    queue.clear();
-    TtsQueueClearResult {
-        cleared,
-        pending_count: 0,
-        currently_speaking,
-    }
-}
-
-/// Simple ISO 8601 timestamp without a chrono dependency
-fn chrono_now() -> String {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = d.as_secs();
-    // Approximate: good enough for inbox timestamps
-    let days = secs / 86400;
-    let time_secs = secs % 86400;
-    let hours = time_secs / 3600;
-    let minutes = (time_secs % 3600) / 60;
-    let seconds = time_secs % 60;
-    // Days since epoch → rough date (accurate for ordering, not calendar display)
-    let years = 1970 + days / 365;
-    let remaining_days = days % 365;
-    let months = remaining_days / 30 + 1;
-    let day = remaining_days % 30 + 1;
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        years, months, day, hours, minutes, seconds
-    )
-}
 
 fn default_true() -> bool {
     true
@@ -289,19 +151,9 @@ fn default_converse_silence_timeout() -> u32 {
 
 #[derive(Clone)]
 pub struct VoiceMcpServer {
-    tts: Arc<Mutex<TtsEngine>>,
-    tts_swap_lock: Arc<TokioMutex<()>>,
-    tts_playback_lock: Arc<TokioMutex<()>>,
-    stt: Arc<Mutex<SttEngine>>,
-    config: SharedConfig,
+    runtime: VoiceRuntime,
     processor: Arc<TokioMutex<OperationProcessor>>,
     tool_router: ToolRouter<Self>,
-    inbox: Arc<Mutex<Vec<InboxMessage>>>,
-    bg_capture: Arc<Mutex<Option<CaptureHandle>>>,
-    bg_active: Arc<AtomicBool>,
-    tts_queue: Arc<TokioMutex<VecDeque<QueuedSpeech>>>,
-    tts_current: Arc<TokioMutex<Option<QueuedSpeech>>>,
-    tts_worker_active: Arc<AtomicBool>,
 }
 
 impl VoiceMcpServer {
@@ -312,465 +164,15 @@ impl VoiceMcpServer {
 
     /// Create a new server with pre-shared engines (for daemon mode).
     pub fn with_shared(
-        tts: Arc<Mutex<TtsEngine>>,
-        stt: Arc<Mutex<SttEngine>>,
+        tts: Arc<std::sync::Mutex<TtsEngine>>,
+        stt: Arc<std::sync::Mutex<SttEngine>>,
         config: SharedConfig,
     ) -> Self {
         Self {
-            tts,
-            tts_swap_lock: Arc::new(TokioMutex::new(())),
-            tts_playback_lock: Arc::new(TokioMutex::new(())),
-            stt,
-            config,
+            runtime: VoiceRuntime::with_shared(tts, stt, config),
             processor: Arc::new(TokioMutex::new(OperationProcessor::new())),
             tool_router: Self::tool_router(),
-            inbox: Arc::new(Mutex::new(Vec::new())),
-            bg_capture: Arc::new(Mutex::new(None)),
-            bg_active: Arc::new(AtomicBool::new(false)),
-            tts_queue: Arc::new(TokioMutex::new(VecDeque::new())),
-            tts_current: Arc::new(TokioMutex::new(None)),
-            tts_worker_active: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    /// Synthesize and play audio using streaming — audio starts playing as chunks
-    /// are generated by the TTS engine, without waiting for full synthesis.
-    ///
-    /// Uses sentence-first streaming for long text to minimize time-to-first-audio.
-    async fn speak(
-        &self,
-        text: &str,
-        voice: Option<&str>,
-        speed: Option<f32>,
-    ) -> std::result::Result<(), String> {
-        let _playback_guard = self.tts_playback_lock.lock().await;
-        self.ensure_tts_model_synced().await?;
-
-        let config = self
-            .config
-            .read()
-            .map_err(|e| format!("Config lock poisoned: {e}"))?
-            .clone();
-        let selected_voice = voice.unwrap_or(&config.voice).to_string();
-        let selected_speed = speed.unwrap_or(config.speed);
-
-        let tts = self.tts.clone();
-        let text = text.to_string();
-
-        let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<f32>>();
-
-        // Query sample rate before spawning (quick lock)
-        let sample_rate = {
-            let tts = tts.lock().map_err(|e| format!("TTS lock: {e}"))?;
-            tts.sample_rate()
-        };
-
-        // Use sentence-first streaming for long text to minimize latency
-        const SENTENCE_STREAMING_THRESHOLD: usize = 150;
-        let use_sentence_streaming = text.len() >= SENTENCE_STREAMING_THRESHOLD
-            && text
-                .chars()
-                .filter(|&c| c == '.' || c == '!' || c == '?')
-                .count()
-                >= 2;
-
-        let t_start = std::time::Instant::now();
-        let text_len_for_log = text.len();
-
-        // Producer: streaming TTS synthesis (blocking, callback pushes chunks)
-        let producer = tokio::task::spawn_blocking(move || {
-            let mut tts = tts.lock().map_err(|e| format!("TTS lock: {e}"))?;
-            let sid = crate::tts::resolve_voice_id(&selected_voice);
-
-            if use_sentence_streaming {
-                tracing::debug!("Using sentence-first streaming for low latency");
-                tts.synthesize_sentences_streaming(&text, sid, selected_speed, std_tx)
-                    .map_err(|e| format!("TTS failed: {e}"))
-            } else {
-                tts.synthesize_streaming(&text, sid, selected_speed, std_tx)
-                    .map_err(|e| format!("TTS failed: {e}"))
-            }
-        });
-
-        // Consumer: streaming audio playback (plays chunks as they arrive)
-        let consumer = audio::play_audio_streaming(std_rx, sample_rate);
-
-        let (prod_result, cons_result) = tokio::join!(producer, consumer);
-        let t_total = t_start.elapsed();
-
-        prod_result.map_err(|e| format!("Producer: {e}"))??;
-        cons_result.map_err(|e| format!("Playback: {e}"))?;
-
-        tracing::debug!(
-            total_ms = t_total.as_millis() as u64,
-            use_sentence_streaming,
-            text_len = text_len_for_log,
-            "TTS streaming complete"
-        );
-
-        Ok(())
-    }
-
-    fn new_speech_id() -> String {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let n = SAY_COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("say-{now_ms}-{n}")
-    }
-
-    async fn enqueue_speech(
-        &self,
-        message: String,
-        voice: Option<String>,
-        speed: f32,
-    ) -> (String, usize) {
-        let id = Self::new_speech_id();
-        let queued = QueuedSpeech {
-            id: id.clone(),
-            message,
-            voice,
-            speed,
-            enqueued_at: chrono_now(),
-        };
-
-        let pending_count = {
-            let mut queue = self.tts_queue.lock().await;
-            queue_push(&mut queue, queued)
-        };
-
-        self.ensure_tts_queue_worker();
-        (id, pending_count)
-    }
-
-    fn ensure_tts_queue_worker(&self) {
-        if self
-            .tts_worker_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let server = self.clone();
-            tokio::spawn(async move {
-                server.run_tts_queue_worker().await;
-            });
-        }
-    }
-
-    async fn run_tts_queue_worker(self) {
-        loop {
-            let next = {
-                let mut queue = self.tts_queue.lock().await;
-                queue_pop(&mut queue)
-            };
-
-            let Some(item) = next else {
-                self.tts_worker_active.store(false, Ordering::Release);
-
-                let has_more = {
-                    let queue = self.tts_queue.lock().await;
-                    !queue.is_empty()
-                };
-
-                if has_more
-                    && self
-                        .tts_worker_active
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                {
-                    continue;
-                }
-
-                break;
-            };
-
-            {
-                let mut current = self.tts_current.lock().await;
-                *current = Some(item.clone());
-            }
-
-            if let Err(e) = self
-                .speak(&item.message, item.voice.as_deref(), Some(item.speed))
-                .await
-            {
-                tracing::error!(speech_id = %item.id, "Queued speech failed: {e}");
-                let message = InboxMessage {
-                    text: format!("queued speech {} failed: {e}", item.id),
-                    timestamp: chrono_now(),
-                    source: Some("tts_queue".to_string()),
-                    conversation_id: None,
-                };
-                if let Ok(mut inbox) = self.inbox.lock() {
-                    inbox.push(message);
-                }
-            }
-
-            {
-                let mut current = self.tts_current.lock().await;
-                *current = None;
-            }
-        }
-    }
-
-    async fn tts_queue_status_snapshot(&self) -> TtsQueueStatus {
-        let current = { self.tts_current.lock().await.clone() };
-        let queue = self.tts_queue.lock().await;
-        queue_status_snapshot(
-            self.tts_worker_active.load(Ordering::Relaxed),
-            current.as_ref(),
-            &queue,
-        )
-    }
-
-    async fn clear_tts_queue(&self) -> TtsQueueClearResult {
-        let currently_speaking = self.tts_current.lock().await.is_some();
-        let mut queue = self.tts_queue.lock().await;
-        clear_pending_queue(&mut queue, currently_speaking)
-    }
-
-    async fn ensure_tts_model_synced(&self) -> std::result::Result<(), String> {
-        let config = self
-            .config
-            .read()
-            .map_err(|e| format!("Config lock poisoned: {e}"))?
-            .clone();
-        let desired_model = config.kokoro_model;
-
-        let current_model = {
-            let tts = self.tts.lock().map_err(|e| format!("TTS lock: {e}"))?;
-            tts.kokoro_model()
-        };
-        if current_model == desired_model {
-            return Ok(());
-        }
-
-        let _guard = self.tts_swap_lock.lock().await;
-
-        let current_model = {
-            let tts = self.tts.lock().map_err(|e| format!("TTS lock: {e}"))?;
-            tts.kokoro_model()
-        };
-        if current_model == desired_model {
-            return Ok(());
-        }
-
-        tracing::info!(
-            current = %current_model,
-            target = %desired_model,
-            "Kokoro model changed in config, preparing swap"
-        );
-
-        models::download_models_with_variant(&config, desired_model)
-            .await
-            .map_err(|e| format!("Model download failed: {e}"))?;
-
-        let config_for_init = config.clone();
-        let new_tts = tokio::task::spawn_blocking(move || TtsEngine::new(&config_for_init))
-            .await
-            .map_err(|e| format!("TTS init task failed: {e}"))?
-            .map_err(|e| format!("TTS init failed: {e}"))?;
-
-        let mut tts = self.tts.lock().map_err(|e| format!("TTS lock: {e}"))?;
-        *tts = new_tts;
-
-        tracing::info!(model = %desired_model, "Kokoro model swap complete");
-        Ok(())
-    }
-
-    /// Record and transcribe speech with adaptive end-of-turn detection.
-    ///
-    /// Uses a grace window (debounce) when silence first exceeds the threshold:
-    /// - Gives the user a chance to resume speaking after a pause
-    /// - Extends the effective silence threshold after significant speech (>3s)
-    /// - Logs state transitions for debugging
-    async fn record_and_transcribe(
-        &self,
-        silence_timeout_ms: u32,
-        min_speech_ms: Option<u32>,
-    ) -> std::result::Result<String, String> {
-        if self.bg_active.load(Ordering::Relaxed) {
-            return Err("Background listener is active. Call stop_listening first.".to_string());
-        }
-        let config = self.config.read().unwrap().clone();
-        let max_speech_secs = VAD_MAX_SPEECH_SECS;
-
-        let (mut rx, capture_handle) = audio::start_capture(
-            config.dsp.hpf_cutoff_hz,
-            config.dsp.noise_gate_rms,
-            config.dsp.noise_gate_window,
-        )
-        .map_err(|e| format!("Capture failed: {e}"))?;
-
-        let mut all_speech_samples: Vec<f32> = Vec::new();
-        let mut vad = VadSession::new(&config, max_speech_secs)
-            .map_err(|e| format!("VAD init failed: {e}"))?;
-
-        let mut speech_started = false;
-        let base_silence_threshold = std::time::Duration::from_millis(silence_timeout_ms as u64);
-
-        // Adaptive silence threshold increases after significant speech
-        const SIGNIFICANT_SPEECH_MS: u64 = 3000;
-        const EXTENDED_SILENCE_BONUS_MS: u64 = 1000; // Add 1s after significant speech
-
-        let mut last_speech_time = std::time::Instant::now();
-        let mut first_speech_time: Option<std::time::Instant> = None;
-        let mut total_speech_duration = std::time::Duration::ZERO;
-        let mut last_speech_segment_start: Option<std::time::Instant> = None;
-
-        // Grace window for confirming end-of-turn (debounce)
-        // When silence first exceeds threshold, we wait this extra time to confirm
-        const GRACE_WINDOW_MS: u64 = 800;
-        let mut pending_end_time: Option<std::time::Instant> = None;
-
-        loop {
-            let chunk = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
-
-            match chunk {
-                Ok(Some(chunk)) => {
-                    vad.accept_waveform(chunk.samples);
-
-                    let is_speech = vad.is_speech();
-
-                    if is_speech {
-                        // Speech detected - update tracking
-                        speech_started = true;
-                        let now = std::time::Instant::now();
-                        last_speech_time = now;
-
-                        if first_speech_time.is_none() {
-                            first_speech_time = Some(now);
-                            tracing::debug!("Speech started");
-                        }
-
-                        if last_speech_segment_start.is_none() {
-                            last_speech_segment_start = Some(now);
-                        }
-
-                        // Cancel any pending end-of-turn
-                        if pending_end_time.is_some() {
-                            pending_end_time = None;
-                            tracing::debug!("Speech resumed, cancelling pending end-of-turn");
-                        }
-
-                        let segments = vad.collect_segments();
-                        for seg in segments {
-                            all_speech_samples.extend_from_slice(&seg.samples);
-                        }
-                    } else {
-                        // Silence - check if speech just ended
-                        if let Some(seg_start) = last_speech_segment_start.take() {
-                            let segment_duration = seg_start.elapsed();
-                            total_speech_duration += segment_duration;
-                            tracing::debug!(
-                                segment_duration_ms = segment_duration.as_millis() as u64,
-                                total_speech_duration_ms = total_speech_duration.as_millis() as u64,
-                                "Speech segment ended"
-                            );
-                        }
-
-                        if speech_started {
-                            let silence_elapsed = last_speech_time.elapsed();
-
-                            // Calculate adaptive threshold
-                            let effective_threshold = if total_speech_duration.as_millis() as u64
-                                >= SIGNIFICANT_SPEECH_MS
-                            {
-                                base_silence_threshold
-                                    + std::time::Duration::from_millis(EXTENDED_SILENCE_BONUS_MS)
-                            } else {
-                                base_silence_threshold
-                            };
-
-                            if silence_elapsed >= effective_threshold {
-                                // Check min_speech_ms first
-                                if let Some(min_ms) = min_speech_ms
-                                    && let Some(first) = first_speech_time
-                                    && first.elapsed()
-                                        < std::time::Duration::from_millis(min_ms as u64)
-                                {
-                                    continue;
-                                }
-
-                                // Start or continue grace window
-                                match pending_end_time {
-                                    None => {
-                                        pending_end_time = Some(std::time::Instant::now());
-                                        tracing::debug!(
-                                            silence_elapsed_ms = silence_elapsed.as_millis() as u64,
-                                            effective_threshold_ms =
-                                                effective_threshold.as_millis() as u64,
-                                            "Silence threshold reached, starting grace window"
-                                        );
-                                    }
-                                    Some(started) => {
-                                        if started.elapsed()
-                                            >= std::time::Duration::from_millis(GRACE_WINDOW_MS)
-                                        {
-                                            tracing::debug!(
-                                                total_speech_duration_ms =
-                                                    total_speech_duration.as_millis() as u64,
-                                                grace_window_ms = GRACE_WINDOW_MS,
-                                                "Grace window expired, confirming end-of-turn"
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(None) => {
-                    tracing::debug!("Audio channel closed, stopping");
-                    break;
-                }
-                Err(_) => {
-                    // Timeout - check pending end-of-turn
-                    if let Some(started) = pending_end_time
-                        && started.elapsed() >= std::time::Duration::from_millis(GRACE_WINDOW_MS)
-                    {
-                        tracing::debug!(
-                            total_speech_duration_ms = total_speech_duration.as_millis() as u64,
-                            grace_window_ms = GRACE_WINDOW_MS,
-                            "Grace window expired (timeout), confirming end-of-turn"
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-
-        capture_handle.stop();
-
-        vad.flush();
-        let segments = vad.collect_segments();
-        for seg in segments {
-            all_speech_samples.extend_from_slice(&seg.samples);
-        }
-
-        if all_speech_samples.is_empty() {
-            return Ok("(no speech detected)".to_string());
-        }
-
-        // Peak-normalize quiet audio to improve STT accuracy
-        audio::peak_normalize(&mut all_speech_samples, config.dsp.normalize_threshold);
-
-        tracing::debug!(
-            num_samples = all_speech_samples.len(),
-            duration_secs = all_speech_samples.len() as f32 / 16000.0,
-            "Transcribing captured speech"
-        );
-
-        let stt = self.stt.clone();
-        let text = tokio::task::spawn_blocking(move || {
-            let mut stt = stt.lock().map_err(|e| format!("STT lock poisoned: {e}"))?;
-            stt.transcribe(16000, &all_speech_samples)
-                .map_err(|e| format!("STT failed: {e}"))
-        })
-        .await
-        .map_err(|e| format!("STT task failed: {e}"))??;
-
-        Ok(text)
     }
 
     fn should_converse_async(params: &ConverseParams) -> bool {
@@ -803,67 +205,54 @@ impl VoiceMcpServer {
         if Self::should_converse_async(&params) {
             let conversation_id = Self::new_conversation_id();
             let conversation_id_for_ack = conversation_id.clone();
-            let server = self.clone();
+            let runtime = self.runtime.clone();
             let params = params;
-            let inbox = self.inbox.clone();
 
             tokio::spawn(async move {
-                let speak_result = server
+                let speak_result = runtime
                     .speak(&params.message, params.voice.as_deref(), Some(params.speed))
                     .await;
 
                 if let Err(e) = speak_result {
-                    let msg = InboxMessage {
+                    runtime.push_inbox(InboxMessage {
                         text: format!("converse failed during speak: {e}"),
                         timestamp: chrono_now(),
                         source: Some("converse".to_string()),
                         conversation_id: Some(conversation_id.clone()),
-                    };
-                    if let Ok(mut inbox) = inbox.lock() {
-                        inbox.push(msg);
-                    }
+                    });
                     return;
                 }
 
                 if !params.wait_for_response {
-                    let msg = InboxMessage {
+                    runtime.push_inbox(InboxMessage {
                         text: "Message spoken successfully".to_string(),
                         timestamp: chrono_now(),
                         source: Some("converse".to_string()),
                         conversation_id: Some(conversation_id.clone()),
-                    };
-                    if let Ok(mut inbox) = inbox.lock() {
-                        inbox.push(msg);
-                    }
+                    });
                     return;
                 }
 
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                match server
+                match runtime
                     .record_and_transcribe(params.silence_timeout_ms, params.min_speech_ms)
                     .await
                 {
                     Ok(text) => {
-                        let msg = InboxMessage {
+                        runtime.push_inbox(InboxMessage {
                             text,
                             timestamp: chrono_now(),
                             source: Some("converse".to_string()),
                             conversation_id: Some(conversation_id.clone()),
-                        };
-                        if let Ok(mut inbox) = inbox.lock() {
-                            inbox.push(msg);
-                        }
+                        });
                     }
                     Err(e) => {
-                        let msg = InboxMessage {
+                        runtime.push_inbox(InboxMessage {
                             text: format!("converse failed during listen/transcribe: {e}"),
                             timestamp: chrono_now(),
                             source: Some("converse".to_string()),
                             conversation_id: Some(conversation_id.clone()),
-                        };
-                        if let Ok(mut inbox) = inbox.lock() {
-                            inbox.push(msg);
-                        }
+                        });
                     }
                 }
             });
@@ -878,7 +267,8 @@ impl VoiceMcpServer {
             )]));
         }
 
-        self.speak(&params.message, params.voice.as_deref(), Some(params.speed))
+        self.runtime
+            .speak(&params.message, params.voice.as_deref(), Some(params.speed))
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
 
@@ -893,6 +283,7 @@ impl VoiceMcpServer {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         let text = self
+            .runtime
             .record_and_transcribe(params.silence_timeout_ms, params.min_speech_ms)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
@@ -909,6 +300,7 @@ impl VoiceMcpServer {
         Parameters(params): Parameters<SayParams>,
     ) -> Result<CallToolResult, McpError> {
         let (speech_id, pending_count) = self
+            .runtime
             .enqueue_speech(params.message, params.voice, params.speed)
             .await;
         let ack = serde_json::json!({
@@ -931,6 +323,7 @@ impl VoiceMcpServer {
         Parameters(params): Parameters<EnqueueSayParams>,
     ) -> Result<CallToolResult, McpError> {
         let (speech_id, pending_count) = self
+            .runtime
             .enqueue_speech(params.message, params.voice, params.speed)
             .await;
         let ack = serde_json::json!({
@@ -952,7 +345,7 @@ impl VoiceMcpServer {
         &self,
         Parameters(_params): Parameters<TtsQueueStatusParams>,
     ) -> Result<CallToolResult, McpError> {
-        let status = self.tts_queue_status_snapshot().await;
+        let status = self.runtime.tts_queue_status_snapshot().await;
         let json = serde_json::to_string_pretty(&status)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
@@ -966,7 +359,7 @@ impl VoiceMcpServer {
         &self,
         Parameters(_params): Parameters<TtsQueueClearParams>,
     ) -> Result<CallToolResult, McpError> {
-        let result = self.clear_tts_queue().await;
+        let result = self.runtime.clear_tts_queue().await;
         let json = serde_json::to_string_pretty(&result)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
@@ -981,6 +374,7 @@ impl VoiceMcpServer {
         Parameters(params): Parameters<ListenParams>,
     ) -> Result<CallToolResult, McpError> {
         let text = self
+            .runtime
             .record_and_transcribe(params.silence_timeout_ms, params.min_speech_ms)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
@@ -996,129 +390,13 @@ impl VoiceMcpServer {
         &self,
         Parameters(_params): Parameters<StartListeningParams>,
     ) -> Result<CallToolResult, McpError> {
-        if self.bg_active.load(Ordering::Relaxed) {
-            return Err(McpError::invalid_request(
-                "Background listener is already active",
-                None,
-            ));
-        }
+        let msg = self
+            .runtime
+            .start_background_listening()
+            .await
+            .map_err(|e| McpError::invalid_request(e, None))?;
 
-        let config = self.config.read().unwrap().clone();
-        let (mut rx, capture_handle) = audio::start_capture(
-            config.dsp.hpf_cutoff_hz,
-            config.dsp.noise_gate_rms,
-            config.dsp.noise_gate_window,
-        )
-        .map_err(|e| McpError::internal_error(format!("Capture failed: {e}"), None))?;
-
-        // Store capture handle
-        {
-            let mut bg = self.bg_capture.lock().unwrap();
-            *bg = Some(capture_handle);
-        }
-        self.bg_active.store(true, Ordering::Relaxed);
-
-        let inbox = self.inbox.clone();
-        let stt = self.stt.clone();
-        let bg_active = self.bg_active.clone();
-        let config_clone = config.clone();
-
-        tokio::spawn(async move {
-            let mut vad = match VadSession::new(&config_clone, 300.0) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!("Background VAD init failed: {e}");
-                    bg_active.store(false, Ordering::Relaxed);
-                    return;
-                }
-            };
-
-            let mut speech_samples: Vec<f32> = Vec::new();
-            let mut speech_active = false;
-            let mut last_speech = std::time::Instant::now();
-            let silence_threshold = std::time::Duration::from_millis(1500);
-
-            loop {
-                if !bg_active.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let chunk =
-                    tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
-
-                match chunk {
-                    Ok(Some(chunk)) => {
-                        vad.accept_waveform(chunk.samples);
-
-                        if vad.is_speech() {
-                            speech_active = true;
-                            last_speech = std::time::Instant::now();
-                            let segments = vad.collect_segments();
-                            for seg in segments {
-                                speech_samples.extend_from_slice(&seg.samples);
-                            }
-                        } else if speech_active
-                            && last_speech.elapsed() >= silence_threshold
-                            && !speech_samples.is_empty()
-                        {
-                            // Flush remaining VAD segments
-                            vad.flush();
-                            let segments = vad.collect_segments();
-                            for seg in segments {
-                                speech_samples.extend_from_slice(&seg.samples);
-                            }
-
-                            // Normalize and transcribe
-                            audio::peak_normalize(
-                                &mut speech_samples,
-                                config_clone.dsp.normalize_threshold,
-                            );
-
-                            let samples = std::mem::take(&mut speech_samples);
-                            let stt_clone = stt.clone();
-                            let inbox_clone = inbox.clone();
-
-                            // Transcribe in a blocking task
-                            tokio::task::spawn_blocking(move || {
-                                let mut stt = match stt_clone.lock() {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        tracing::error!("STT lock failed: {e}");
-                                        return;
-                                    }
-                                };
-                                match stt.transcribe(16000, &samples) {
-                                    Ok(text) => {
-                                        if !text.is_empty() && text != "(no speech detected)" {
-                                            let msg = InboxMessage {
-                                                text,
-                                                timestamp: chrono_now(),
-                                                source: Some("background_listening".to_string()),
-                                                conversation_id: None,
-                                            };
-                                            if let Ok(mut inbox) = inbox_clone.lock() {
-                                                inbox.push(msg);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Background STT failed: {e}");
-                                    }
-                                }
-                            });
-
-                            speech_active = false;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => {} // timeout, loop
-                }
-            }
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            "Background listening started",
-        )]))
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(
@@ -1129,10 +407,7 @@ impl VoiceMcpServer {
         &self,
         Parameters(_params): Parameters<CheckInboxParams>,
     ) -> Result<CallToolResult, McpError> {
-        let messages: Vec<InboxMessage> = {
-            let mut inbox = self.inbox.lock().unwrap();
-            inbox.drain(..).collect()
-        };
+        let messages = self.runtime.drain_inbox();
 
         let json = serde_json::to_string_pretty(&messages).unwrap_or_else(|_| "[]".to_string());
 
@@ -1147,30 +422,11 @@ impl VoiceMcpServer {
         &self,
         Parameters(_params): Parameters<StopListeningParams>,
     ) -> Result<CallToolResult, McpError> {
-        if !self.bg_active.load(Ordering::Relaxed) {
-            return Err(McpError::invalid_request(
-                "Background listener is not active",
-                None,
-            ));
-        }
-
-        // Stop capture
-        {
-            let mut bg = self.bg_capture.lock().unwrap();
-            if let Some(handle) = bg.take() {
-                handle.stop();
-            }
-        }
-        self.bg_active.store(false, Ordering::Relaxed);
-
-        // Brief delay to let background task finish processing
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        // Drain inbox
-        let messages: Vec<InboxMessage> = {
-            let mut inbox = self.inbox.lock().unwrap();
-            inbox.drain(..).collect()
-        };
+        let messages = self
+            .runtime
+            .stop_background_listening()
+            .await
+            .map_err(|e| McpError::invalid_request(e, None))?;
 
         let json = serde_json::to_string_pretty(&messages).unwrap_or_else(|_| "[]".to_string());
 
@@ -1185,20 +441,11 @@ impl VoiceMcpServer {
         &self,
         Parameters(_params): Parameters<ResetDspParams>,
     ) -> Result<CallToolResult, McpError> {
-        Config::reset_dsp().map_err(|e| McpError::internal_error(e, None))?;
-        Config::reload_into(&self.config).map_err(|e| McpError::internal_error(e, None))?;
-        let defaults = crate::config::DspConfig::default();
-        let msg = format!(
-            "DSP parameters reset to defaults and applied:\n  \
-             hpf_cutoff_hz:       {}\n  \
-             noise_gate_rms:      {}\n  \
-             noise_gate_window:   {}\n  \
-             normalize_threshold: {}",
-            defaults.hpf_cutoff_hz,
-            defaults.noise_gate_rms,
-            defaults.noise_gate_window,
-            defaults.normalize_threshold,
-        );
+        let msg = self
+            .runtime
+            .reset_dsp()
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
@@ -1210,12 +457,11 @@ impl VoiceMcpServer {
         &self,
         Parameters(_params): Parameters<ReloadConfigParams>,
     ) -> Result<CallToolResult, McpError> {
-        Config::reload_into(&self.config).map_err(|e| McpError::internal_error(e, None))?;
-        self.ensure_tts_model_synced()
+        let msg = self
+            .runtime
+            .reload_config()
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
-        let config = self.config.read().unwrap();
-        let msg = format!("Config reloaded:\n\n{}", config.display_all());
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
@@ -1227,7 +473,10 @@ impl VoiceMcpServer {
         &self,
         Parameters(params): Parameters<CalibrateParams>,
     ) -> Result<CallToolResult, McpError> {
-        let config = self.config.read().unwrap().clone();
+        let config = self
+            .runtime
+            .config_snapshot()
+            .map_err(|e| McpError::internal_error(e, None))?;
         let speech_secs = params.speech_secs.unwrap_or(10);
         let silence_secs = params.silence_secs.unwrap_or(5);
         let dry_run = params.dry_run;
@@ -1245,7 +494,10 @@ impl VoiceMcpServer {
 
         // Auto-reload config so new DSP params take effect immediately
         if !dry_run {
-            Config::reload_into(&self.config).map_err(|e| McpError::internal_error(e, None))?;
+            self.runtime
+                .reload_config()
+                .await
+                .map_err(|e| McpError::internal_error(e, None))?;
         }
 
         let status = if dry_run {
@@ -1305,16 +557,6 @@ impl ServerHandler for VoiceMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn queued(id: &str, message: &str) -> QueuedSpeech {
-        QueuedSpeech {
-            id: id.to_string(),
-            message: message.to_string(),
-            voice: Some("af_heart".to_string()),
-            speed: 1.0,
-            enqueued_at: "2026-01-01T00:00:00Z".to_string(),
-        }
-    }
 
     #[test]
     fn default_true_returns_true() {
@@ -1536,62 +778,5 @@ mod tests {
         assert!(!params.dry_run);
         assert_eq!(params.speech_secs, Some(15));
         assert_eq!(params.silence_secs, Some(8));
-    }
-
-    #[test]
-    fn chrono_now_produces_valid_format() {
-        let ts = chrono_now();
-        assert!(ts.ends_with('Z'));
-        assert!(ts.contains('T'));
-        assert_eq!(ts.len(), 20); // YYYY-MM-DDTHH:MM:SSZ
-    }
-
-    #[test]
-    fn preview_text_truncates_long_messages() {
-        let long = "a".repeat(90);
-        let preview = preview_text(&long);
-        assert_eq!(preview.len(), 83);
-        assert!(preview.ends_with("..."));
-    }
-
-    #[test]
-    fn queue_push_and_pop_preserve_fifo_order() {
-        let mut q = VecDeque::new();
-        assert_eq!(queue_push(&mut q, queued("one", "first")), 1);
-        assert_eq!(queue_push(&mut q, queued("two", "second")), 2);
-
-        let first = queue_pop(&mut q).unwrap();
-        let second = queue_pop(&mut q).unwrap();
-        assert_eq!(first.id, "one");
-        assert_eq!(second.id, "two");
-        assert!(queue_pop(&mut q).is_none());
-    }
-
-    #[test]
-    fn queue_status_snapshot_reports_current_and_pending() {
-        let mut q = VecDeque::new();
-        queue_push(&mut q, queued("one", "first message"));
-        queue_push(&mut q, queued("two", "second message"));
-        let current = queued("cur", "currently speaking");
-
-        let status = queue_status_snapshot(true, Some(&current), &q);
-        assert!(status.worker_active);
-        assert_eq!(status.pending_count, 2);
-        assert_eq!(status.pending.len(), 2);
-        assert_eq!(status.pending[0].id, "one");
-        assert_eq!(status.currently_speaking.unwrap().id, "cur");
-    }
-
-    #[test]
-    fn clear_pending_queue_clears_only_pending_items() {
-        let mut q = VecDeque::new();
-        queue_push(&mut q, queued("one", "first"));
-        queue_push(&mut q, queued("two", "second"));
-
-        let cleared = clear_pending_queue(&mut q, true);
-        assert_eq!(cleared.cleared, 2);
-        assert_eq!(cleared.pending_count, 0);
-        assert!(cleared.currently_speaking);
-        assert!(q.is_empty());
     }
 }
