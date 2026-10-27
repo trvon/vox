@@ -8,10 +8,12 @@ mod config;
 mod daemon;
 mod error;
 mod models;
+mod recording;
 mod runtime;
 mod server;
 mod stt;
 mod tool_client;
+mod transcript;
 mod tts;
 mod vad;
 
@@ -111,8 +113,8 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
             eprintln!("All models downloaded successfully.");
         }
         Some(Command::Tool { url, action }) => {
-            let tool_name = tool_action_name(&action);
-            let result = match handle_tool_command(url.as_deref(), action).await {
+            let (tool_name, args) = tool_action_request(&action);
+            let result = match tool_client::call_tool(url.as_deref(), tool_name, args).await {
                 Ok(ok) => tool_client::print_success(&ok),
                 Err(err) => {
                     let cli_err = tool_client::map_error(tool_name, &err);
@@ -121,6 +123,18 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
                 }
             };
             result?;
+        }
+        Some(Command::Transcribe {
+            path,
+            format,
+            out,
+            title,
+            reference,
+        }) => {
+            if !models::transcription_models_ready(&config) {
+                models::download_transcription_models(&config).await?;
+            }
+            transcribe_local(&config, path, format, out, title, reference).await?;
         }
         Some(Command::Calibrate {
             speech_secs,
@@ -184,31 +198,6 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
     }
 
     Ok(())
-}
-
-async fn handle_tool_command(
-    url: Option<&str>,
-    action: ToolAction,
-) -> eyre::Result<tool_client::CliSuccess> {
-    let (tool_name, args) = tool_action_request(&action);
-    tool_client::call_tool(url, tool_name, args).await
-}
-
-fn tool_action_name(action: &ToolAction) -> &'static str {
-    match action {
-        ToolAction::Say { .. } => "say",
-        ToolAction::EnqueueSay { .. } => "enqueue_say",
-        ToolAction::TtsQueueStatus => "tts_queue_status",
-        ToolAction::TtsQueueClear => "tts_queue_clear",
-        ToolAction::Listen { .. } => "listen",
-        ToolAction::StartListening => "start_listening",
-        ToolAction::CheckInbox => "check_inbox",
-        ToolAction::StopListening => "stop_listening",
-        ToolAction::ResetDsp => "reset_dsp",
-        ToolAction::ReloadConfig => "reload_config",
-        ToolAction::Converse { .. } => "converse",
-        ToolAction::Calibrate { .. } => "calibrate",
-    }
 }
 
 fn tool_action_request(action: &ToolAction) -> (&'static str, serde_json::Value) {
@@ -286,6 +275,59 @@ fn tool_action_request(action: &ToolAction) -> (&'static str, serde_json::Value)
                 "dry_run": !save,
             }),
         ),
+        ToolAction::StartRecording { title, no_audio } => (
+            "start_recording",
+            serde_json::json!({ "title": title, "save_audio": !no_audio }),
+        ),
+        ToolAction::StopRecording {
+            id,
+            cancel,
+            no_wait,
+        } => (
+            "stop_recording",
+            serde_json::json!({ "recording_id": id, "cancel": cancel, "wait": !no_wait }),
+        ),
+        ToolAction::RecordingStatus { id } => (
+            "recording_status",
+            serde_json::json!({ "recording_id": id }),
+        ),
+        ToolAction::MarkRecording { label, id } => (
+            "mark_recording",
+            serde_json::json!({ "label": label, "recording_id": id }),
+        ),
+        ToolAction::ListRecordings { limit } => {
+            ("list_recordings", serde_json::json!({ "limit": limit }))
+        }
+        ToolAction::TranscribeFile { path, title, wait } => {
+            // Resolve relative paths against the caller's cwd, not the daemon's.
+            let path = std::path::absolute(path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| path.clone());
+            (
+                "transcribe_file",
+                serde_json::json!({ "path": path, "title": title, "wait": wait }),
+            )
+        }
+        ToolAction::GetTranscript { id, cursor, limit } => (
+            "get_transcript",
+            serde_json::json!({ "recording_id": id, "cursor": cursor, "limit": limit }),
+        ),
+        ToolAction::ExportTranscript {
+            id,
+            format,
+            paragraph_gap_secs,
+            section_minutes,
+            max_chars,
+        } => (
+            "export_transcript",
+            serde_json::json!({
+                "recording_id": id,
+                "format": format,
+                "paragraph_gap_secs": paragraph_gap_secs,
+                "section_minutes": section_minutes,
+                "max_chars": max_chars,
+            }),
+        ),
     }
 }
 
@@ -328,14 +370,89 @@ async fn init_engines(config: &Config) -> eyre::Result<(tts::TtsEngine, stt::Stt
     Ok((tts_engine, stt_engine))
 }
 
+/// `vox transcribe`: run a file job in-process and print the export.
+async fn transcribe_local(
+    config: &Config,
+    path: std::path::PathBuf,
+    format: recording::ExportFormat,
+    out: Option<std::path::PathBuf>,
+    title: Option<String>,
+    reference: Option<std::path::PathBuf>,
+) -> eyre::Result<()> {
+    let t_load = std::time::Instant::now();
+    let c = config.clone();
+    let stt = tokio::task::spawn_blocking(move || stt::SttEngine::new(&c)).await??;
+    let load_ms = t_load.elapsed().as_millis();
+    let manager = std::sync::Arc::new(recording::RecordingManager::new(
+        config.recordings_dir(),
+        std::sync::Arc::new(std::sync::Mutex::new(stt)),
+    ));
+
+    let t0 = std::time::Instant::now();
+    let (view, mut done) = manager
+        .transcribe_file(config, path, title)
+        .map_err(|e| eyre::eyre!(e))?;
+    let id = view.manifest.id.clone();
+    let _ = done.wait_for(|d| *d).await;
+    let wall = t0.elapsed();
+
+    let view = manager.view(&id).map_err(|e| eyre::eyre!(e))?;
+    if let Some(err) = &view.manifest.error {
+        eyre::bail!("transcription failed: {err}");
+    }
+    let (export_path, content) = manager
+        .export(&id, format, &transcript::LayoutOptions::default())
+        .map_err(|e| eyre::eyre!(e))?;
+    match out {
+        Some(p) => std::fs::write(&p, &content)?,
+        None => print!("{content}"),
+    }
+
+    let m = &view.manifest;
+    let audio_s = m.captured_ms as f64 / 1000.0;
+    eprintln!(
+        "\n{id}: {:.1}s audio, {} segments, {:.1}s speech | wall {:.2}s (RTF {:.3}) | STT {:.2}s (RTF {:.3}) | model load {load_ms} ms\nsaved: {}",
+        audio_s,
+        m.segment_count,
+        m.speech_ms as f64 / 1000.0,
+        wall.as_secs_f64(),
+        wall.as_secs_f64() / audio_s.max(1e-9),
+        m.stt_compute_ms as f64 / 1000.0,
+        m.stt_rtf().unwrap_or(0.0),
+        export_path.display(),
+    );
+    if let Some(reference) = reference {
+        let reference = std::fs::read_to_string(&reference)?;
+        let (text_path, hyp) = manager
+            .export(
+                &id,
+                recording::ExportFormat::Text,
+                &transcript::LayoutOptions::default(),
+            )
+            .map_err(|e| eyre::eyre!(e))?;
+        let _ = text_path;
+        let w = transcript::word_error_rate(&reference, &hyp);
+        eprintln!(
+            "WER {:.2}% ({} edits / {} reference words)",
+            w.wer() * 100.0,
+            w.edits,
+            w.reference_words
+        );
+    }
+    Ok(())
+}
+
 /// Run as a stdio MCP server (default, backward-compatible).
 async fn run_stdio(tts: tts::TtsEngine, stt: stt::SttEngine, config: Config) -> eyre::Result<()> {
     eprintln!("Vox MCP server ready (stdio)");
     let config = config.into_shared();
     let _watcher = config::start_config_watcher(config.clone());
-    let server = server::VoiceMcpServer::new(tts, stt, config);
+    let runtime = runtime::VoiceRuntime::new(tts, stt, config);
+    let server = server::VoiceMcpServer::from_runtime(runtime.clone());
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
+    // The client went away; finalize any recording it left running.
+    runtime.shutdown().await;
     Ok(())
 }
 
@@ -370,13 +487,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_action_name_matches_queue_tools() {
+    fn tool_action_request_matches_queue_tools() {
         assert_eq!(
-            tool_action_name(&ToolAction::TtsQueueStatus),
+            tool_action_request(&ToolAction::TtsQueueStatus).0,
             "tts_queue_status"
         );
         assert_eq!(
-            tool_action_name(&ToolAction::TtsQueueClear),
+            tool_action_request(&ToolAction::TtsQueueClear).0,
             "tts_queue_clear"
         );
     }

@@ -1,9 +1,10 @@
-use crate::audio::{self, CaptureHandle};
+use crate::audio;
 use crate::config::{Config, SharedConfig};
 use crate::models;
+use crate::recording::RecordingManager;
 use crate::stt::SttEngine;
 use crate::tts::TtsEngine;
-use crate::vad::VadSession;
+use crate::vad::{VadOptions, VadSegment, VadSession};
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -13,7 +14,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 
 static SAY_COUNTER: AtomicU64 = AtomicU64::new(1);
-const VAD_MAX_SPEECH_SECS: f32 = 86400.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxMessage {
@@ -125,25 +125,77 @@ fn clear_pending_queue(
     }
 }
 
+/// Current UTC time as RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
 pub(crate) fn chrono_now() -> String {
-    let d = std::time::SystemTime::now()
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = d.as_secs();
-    let days = secs / 86400;
-    let time_secs = secs % 86400;
-    let hours = time_secs / 3600;
-    let minutes = (time_secs % 3600) / 60;
-    let seconds = time_secs % 60;
-    let years = 1970 + days / 365;
-    let remaining_days = days % 365;
-    let months = remaining_days / 30 + 1;
-    let day = remaining_days % 30 + 1;
+        .unwrap_or_default()
+        .as_secs();
+    format_utc(secs)
+}
+
+/// Format Unix seconds as RFC 3339 UTC.
+pub(crate) fn format_utc(secs: u64) -> String {
+    let (y, m, d) = civil_from_days((secs / 86400) as i64);
+    let t = secs % 86400;
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        years, months, day, hours, minutes, seconds
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        t / 3600,
+        (t % 3600) / 60,
+        t % 60
     )
 }
+
+/// Days since 1970-01-01 → proleptic Gregorian (year, month, day).
+/// Howard Hinnant's `civil_from_days`; exact for all i64 day counts we use.
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
+}
+
+/// Completed segments arrive when VAD detection switches to silence.
+struct BackgroundSpeech {
+    samples: Vec<f32>,
+    last_speech: std::time::Instant,
+}
+
+impl BackgroundSpeech {
+    fn new() -> Self {
+        Self {
+            samples: Vec::new(),
+            last_speech: std::time::Instant::now(),
+        }
+    }
+
+    fn accept(&mut self, detected: bool, segments: Vec<VadSegment>) {
+        if detected {
+            self.last_speech = std::time::Instant::now();
+        }
+        for seg in segments {
+            self.samples.extend(seg.samples);
+        }
+    }
+
+    fn take_ready(&mut self, silence: std::time::Duration) -> Option<Vec<f32>> {
+        if !self.samples.is_empty()
+            && (self.last_speech.elapsed() >= silence || self.samples.len() >= 20 * 16_000)
+        {
+            Some(std::mem::take(&mut self.samples))
+        } else {
+            None
+        }
+    }
+}
+
+type BackgroundTask = tokio::task::JoinHandle<std::result::Result<(), String>>;
 
 #[derive(Clone)]
 pub(crate) struct VoiceRuntime {
@@ -151,13 +203,15 @@ pub(crate) struct VoiceRuntime {
     tts_swap_lock: Arc<TokioMutex<()>>,
     tts_playback_lock: Arc<TokioMutex<()>>,
     stt: Arc<Mutex<SttEngine>>,
+    stt_swap_lock: Arc<TokioMutex<()>>,
     config: SharedConfig,
     inbox: Arc<Mutex<Vec<InboxMessage>>>,
-    bg_capture: Arc<Mutex<Option<CaptureHandle>>>,
+    bg_task: Arc<TokioMutex<Option<BackgroundTask>>>,
     bg_active: Arc<AtomicBool>,
     tts_queue: Arc<TokioMutex<VecDeque<QueuedSpeech>>>,
     tts_current: Arc<TokioMutex<Option<QueuedSpeech>>>,
     tts_worker_active: Arc<AtomicBool>,
+    recordings: Arc<RecordingManager>,
 }
 
 impl VoiceRuntime {
@@ -170,14 +224,20 @@ impl VoiceRuntime {
         stt: Arc<Mutex<SttEngine>>,
         config: SharedConfig,
     ) -> Self {
+        let recordings_root = config
+            .read()
+            .map(|c| c.recordings_dir())
+            .unwrap_or_else(|_| crate::config::Config::default().recordings_dir());
         Self {
+            recordings: Arc::new(RecordingManager::new(recordings_root, stt.clone())),
             tts,
             tts_swap_lock: Arc::new(TokioMutex::new(())),
             tts_playback_lock: Arc::new(TokioMutex::new(())),
             stt,
+            stt_swap_lock: Arc::new(TokioMutex::new(())),
             config,
             inbox: Arc::new(Mutex::new(Vec::new())),
-            bg_capture: Arc::new(Mutex::new(None)),
+            bg_task: Arc::new(TokioMutex::new(None)),
             bg_active: Arc::new(AtomicBool::new(false)),
             tts_queue: Arc::new(TokioMutex::new(VecDeque::new())),
             tts_current: Arc::new(TokioMutex::new(None)),
@@ -190,6 +250,58 @@ impl VoiceRuntime {
             .read()
             .map_err(|e| format!("Config lock poisoned: {e}"))
             .map(|c| c.clone())
+    }
+
+    pub(crate) fn recordings(&self) -> &Arc<RecordingManager> {
+        &self.recordings
+    }
+
+    pub(crate) async fn start_recording(
+        &self,
+        title: Option<String>,
+        save_audio: bool,
+    ) -> std::result::Result<crate::recording::JobView, String> {
+        self.ensure_stt_model_synced().await?;
+        self.recordings
+            .start_live(&self.config_snapshot()?, title, save_audio)
+    }
+
+    pub(crate) async fn transcribe_file(
+        &self,
+        path: std::path::PathBuf,
+        title: Option<String>,
+    ) -> std::result::Result<
+        (
+            crate::recording::JobView,
+            tokio::sync::watch::Receiver<bool>,
+        ),
+        String,
+    > {
+        self.ensure_stt_model_synced().await?;
+        self.recordings
+            .transcribe_file(&self.config_snapshot()?, path, title)
+    }
+
+    pub(crate) async fn calibrate(
+        &self,
+        speech_secs: u32,
+        silence_secs: u32,
+        dry_run: bool,
+    ) -> std::result::Result<crate::calibrate::CalibrationResult, String> {
+        let result = crate::calibrate::run_calibration(
+            &self.config_snapshot()?,
+            speech_secs,
+            silence_secs,
+            40,
+            30,
+            dry_run,
+        )
+        .await
+        .map_err(|e| format!("Calibration failed: {e}"))?;
+        if !dry_run {
+            self.reload_config().await?;
+        }
+        Ok(result)
     }
 
     pub(crate) fn push_inbox(&self, message: InboxMessage) {
@@ -269,6 +381,24 @@ impl VoiceRuntime {
         Ok(())
     }
 
+    /// Application composition shared by synchronous and inbox delivery.
+    pub(crate) async fn converse(
+        &self,
+        message: &str,
+        voice: Option<&str>,
+        speed: f32,
+        listen: Option<(u32, Option<u32>)>,
+    ) -> std::result::Result<String, String> {
+        self.speak(message, voice, Some(speed)).await?;
+        let Some((silence_timeout_ms, min_speech_ms)) = listen else {
+            return Ok("Message spoken successfully".into());
+        };
+        // Let output buffers drain before opening capture to reduce TTS echo.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        self.record_and_transcribe(silence_timeout_ms, min_speech_ms)
+            .await
+    }
+
     pub(crate) async fn enqueue_speech(
         &self,
         message: String,
@@ -317,8 +447,8 @@ impl VoiceRuntime {
         if self.bg_active.load(Ordering::Relaxed) {
             return Err("Background listener is active. Call stop_listening first.".to_string());
         }
+        self.ensure_stt_model_synced().await?;
         let config = self.config_snapshot()?;
-        let max_speech_secs = VAD_MAX_SPEECH_SECS;
 
         let (mut rx, capture_handle) = audio::start_capture(
             config.dsp.hpf_cutoff_hz,
@@ -328,7 +458,7 @@ impl VoiceRuntime {
         .map_err(|e| format!("Capture failed: {e}"))?;
 
         let mut all_speech_samples: Vec<f32> = Vec::new();
-        let mut vad = VadSession::new(&config, max_speech_secs)
+        let mut vad = VadSession::new(&config, VadOptions::default())
             .map_err(|e| format!("VAD init failed: {e}"))?;
 
         let mut speech_started = false;
@@ -350,7 +480,7 @@ impl VoiceRuntime {
 
             match chunk {
                 Ok(Some(chunk)) => {
-                    vad.accept_waveform(chunk.samples);
+                    vad.accept_waveform(&chunk.samples);
 
                     let is_speech = vad.is_speech();
 
@@ -488,138 +618,120 @@ impl VoiceRuntime {
     }
 
     pub(crate) async fn start_background_listening(&self) -> std::result::Result<String, String> {
-        if self.bg_active.load(Ordering::Relaxed) {
-            return Err("Background listener is already active".to_string());
+        let mut task = self.bg_task.lock().await;
+        if task.is_some() {
+            return Err("Background listener already started; call stop_listening first".into());
         }
-
+        self.ensure_stt_model_synced().await?;
         let config = self.config_snapshot()?;
-        let (mut rx, capture_handle) = audio::start_capture(
+        let mut vad = VadSession::new(&config, VadOptions::default())
+            .map_err(|e| format!("Background VAD init failed: {e}"))?;
+        let (mut rx, mut capture) = audio::start_capture(
             config.dsp.hpf_cutoff_hz,
             config.dsp.noise_gate_rms,
             config.dsp.noise_gate_window,
         )
         .map_err(|e| format!("Capture failed: {e}"))?;
-
-        {
-            let mut bg = self.bg_capture.lock().unwrap();
-            *bg = Some(capture_handle);
-        }
-        self.bg_active.store(true, Ordering::Relaxed);
-
+        self.bg_active.store(true, Ordering::Release);
         let runtime = self.clone();
-        let config_clone = config.clone();
-
-        tokio::spawn(async move {
-            let mut vad = match VadSession::new(&config_clone, 300.0) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!("Background VAD init failed: {e}");
-                    runtime.bg_active.store(false, Ordering::Relaxed);
-                    return;
-                }
-            };
-
-            let mut speech_samples: Vec<f32> = Vec::new();
-            let mut speech_active = false;
-            let mut last_speech = std::time::Instant::now();
-            let silence_threshold = std::time::Duration::from_millis(1500);
-
-            loop {
-                if !runtime.bg_active.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let chunk =
-                    tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
-
-                match chunk {
-                    Ok(Some(chunk)) => {
-                        vad.accept_waveform(chunk.samples);
-
-                        if vad.is_speech() {
-                            speech_active = true;
-                            last_speech = std::time::Instant::now();
-                            let segments = vad.collect_segments();
-                            for seg in segments {
-                                speech_samples.extend_from_slice(&seg.samples);
-                            }
-                        } else if speech_active
-                            && last_speech.elapsed() >= silence_threshold
-                            && !speech_samples.is_empty()
-                        {
-                            vad.flush();
-                            let segments = vad.collect_segments();
-                            for seg in segments {
-                                speech_samples.extend_from_slice(&seg.samples);
-                            }
-
-                            audio::peak_normalize(
-                                &mut speech_samples,
-                                config_clone.dsp.normalize_threshold,
-                            );
-
-                            let samples = std::mem::take(&mut speech_samples);
-                            let runtime_for_stt = runtime.clone();
-
-                            tokio::task::spawn_blocking(move || {
-                                let mut stt: std::sync::MutexGuard<'_, SttEngine> =
-                                    match runtime_for_stt.stt.lock() {
-                                        Ok(s) => s,
-                                        Err(e) => {
-                                            tracing::error!("STT lock failed: {e}");
-                                            return;
-                                        }
-                                    };
-                                match stt.transcribe(16000, &samples) {
-                                    Ok(text) => {
-                                        if !text.is_empty() && text != "(no speech detected)" {
-                                            runtime_for_stt.push_inbox(InboxMessage {
-                                                text,
-                                                timestamp: chrono_now(),
-                                                source: Some("background_listening".to_string()),
-                                                conversation_id: None,
-                                            });
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Background STT failed: {e}");
-                                    }
-                                }
-                            });
-
-                            speech_active = false;
+        *task = Some(tokio::spawn(async move {
+            let result = async {
+                let mut speech = BackgroundSpeech::new();
+                let silence = std::time::Duration::from_millis(1500);
+                while runtime.bg_active.load(Ordering::Acquire) {
+                    match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                        .await
+                    {
+                        Ok(Some(chunk)) => {
+                            vad.accept_waveform(&chunk.samples);
+                            let detected = vad.is_speech();
+                            speech.accept(detected, vad.collect_segments());
                         }
+                        Ok(None) => {
+                            return Err("Background audio capture ended unexpectedly".into());
+                        }
+                        Err(_) => {}
                     }
-                    Ok(None) => break,
-                    Err(_) => {}
+                    if let Some(samples) = speech.take_ready(silence) {
+                        runtime
+                            .transcribe_background(samples, config.dsp.normalize_threshold)
+                            .await?;
+                    }
                 }
+                capture.finish();
+                while let Ok(chunk) = rx.try_recv() {
+                    vad.accept_waveform(&chunk.samples);
+                    speech.accept(false, vad.collect_segments());
+                }
+                vad.flush();
+                speech.accept(false, vad.collect_segments());
+                if !speech.samples.is_empty() {
+                    runtime
+                        .transcribe_background(speech.samples, config.dsp.normalize_threshold)
+                        .await?;
+                }
+                Ok(())
             }
-        });
+            .await;
+            drop(capture);
+            runtime.bg_active.store(false, Ordering::Release);
+            result
+        }));
+        Ok("Background listening started".into())
+    }
 
-        Ok("Background listening started".to_string())
+    async fn transcribe_background(
+        &self,
+        mut samples: Vec<f32>,
+        threshold: f32,
+    ) -> std::result::Result<(), String> {
+        audio::peak_normalize(&mut samples, threshold);
+        let stt = self.stt.clone();
+        let text = tokio::task::spawn_blocking(move || {
+            stt.lock()
+                .map_err(|e| format!("STT lock: {e}"))?
+                .transcribe(16000, &samples)
+                .map_err(|e| format!("STT failed: {e}"))
+        })
+        .await
+        .map_err(|e| format!("Background STT task: {e}"))??;
+        if !text.is_empty() && text != "(no speech detected)" {
+            self.push_inbox(InboxMessage {
+                text,
+                timestamp: chrono_now(),
+                source: Some("background_listening".into()),
+                conversation_id: None,
+            });
+        }
+        Ok(())
     }
 
     pub(crate) async fn stop_background_listening(
         &self,
     ) -> std::result::Result<Vec<InboxMessage>, String> {
-        if !self.bg_active.load(Ordering::Relaxed) {
-            return Err("Background listener is not active".to_string());
-        }
-
-        {
-            let mut bg = self.bg_capture.lock().unwrap();
-            if let Some(handle) = bg.take() {
-                handle.stop();
-            }
-        }
-        self.bg_active.store(false, Ordering::Relaxed);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut task = self.bg_task.lock().await;
+        let worker = task.take().ok_or("Background listener is not active")?;
+        self.bg_active.store(false, Ordering::Release);
+        worker
+            .await
+            .map_err(|e| format!("Background listener: {e}"))??;
         Ok(self.drain_inbox())
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        let has_background = self.bg_task.lock().await.is_some();
+        if has_background && let Err(e) = self.stop_background_listening().await {
+            tracing::warn!("Background listener shutdown: {e}");
+        }
+        self.recordings
+            .shutdown(std::time::Duration::from_secs(20))
+            .await;
     }
 
     pub(crate) async fn reload_config(&self) -> std::result::Result<String, String> {
         Config::reload_into(&self.config).map_err(|e| e.to_string())?;
         self.ensure_tts_model_synced().await?;
+        self.ensure_stt_model_synced().await?;
         let config = self
             .config
             .read()
@@ -714,6 +826,34 @@ impl VoiceRuntime {
         }
     }
 
+    async fn ensure_stt_model_synced(&self) -> std::result::Result<(), String> {
+        let _guard = self.stt_swap_lock.lock().await;
+        let config = self.config_snapshot()?;
+        let stt = self.stt.clone();
+        let matches = tokio::task::spawn_blocking(move || {
+            stt.lock()
+                .map_err(|e| format!("STT lock: {e}"))
+                .map(|s| s.matches_config(&config))
+        })
+        .await
+        .map_err(|e| format!("STT check task: {e}"))??;
+        if !matches {
+            let config = self.config_snapshot()?;
+            let replacement = tokio::task::spawn_blocking(move || SttEngine::new(&config))
+                .await
+                .map_err(|e| format!("STT load task: {e}"))?
+                .map_err(|e| format!("STT reload: {e}"))?;
+            let stt = self.stt.clone();
+            tokio::task::spawn_blocking(move || {
+                *stt.lock().map_err(|e| format!("STT lock: {e}"))? = replacement;
+                Ok::<_, String>(())
+            })
+            .await
+            .map_err(|e| format!("STT swap task: {e}"))??;
+        }
+        Ok(())
+    }
+
     async fn ensure_tts_model_synced(&self) -> std::result::Result<(), String> {
         let config = self.config_snapshot()?;
         let desired_model = config.kokoro_model;
@@ -775,11 +915,88 @@ mod tests {
     }
 
     #[test]
+    fn background_collects_completed_segments_after_detection_stops() {
+        let mut speech = BackgroundSpeech::new();
+        speech.accept(true, Vec::new());
+        speech.accept(
+            false,
+            vec![VadSegment {
+                start_sample: 0,
+                samples: vec![0.5; 512],
+            }],
+        );
+        assert_eq!(
+            speech.take_ready(std::time::Duration::ZERO).unwrap().len(),
+            512
+        );
+        assert!(speech.take_ready(std::time::Duration::ZERO).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires installed Kokoro and Silero models; no microphone or playback"]
+    fn background_model_short_utterance_drains_after_silence() {
+        let config = Config::default();
+        let mut tts = TtsEngine::new(&config).unwrap();
+        let output = tts
+            .synthesize(
+                "The quick brown fox jumps over the lazy dog.",
+                None,
+                Some(1.0),
+            )
+            .unwrap();
+        let mut pcm = vec![0.0; 8000];
+        pcm.extend(audio::resample(&output.samples, output.sample_rate, 16000));
+        pcm.extend(vec![0.0; 48000]);
+        let mut vad = VadSession::new(&config, VadOptions::default()).unwrap();
+        let mut speech = BackgroundSpeech::new();
+        let mut delivered = 0;
+        for chunk in pcm.chunks(crate::vad::VAD_WINDOW_SIZE) {
+            vad.accept_waveform(chunk);
+            let detected = vad.is_speech();
+            speech.accept(detected, vad.collect_segments());
+            if let Some(samples) = speech.take_ready(std::time::Duration::ZERO) {
+                delivered += samples.len();
+            }
+        }
+        assert!(
+            delivered > 0,
+            "short utterance must be delivered without a forced split or final flush"
+        );
+        assert!(vad.collect_segments().is_empty());
+    }
+
+    #[test]
+    fn background_continuous_speech_is_bounded() {
+        let mut speech = BackgroundSpeech::new();
+        speech.accept(
+            true,
+            vec![VadSegment {
+                start_sample: 0,
+                samples: vec![0.5; 20 * 16_000],
+            }],
+        );
+        assert!(
+            speech
+                .take_ready(std::time::Duration::from_secs(1500))
+                .is_some()
+        );
+    }
+
+    #[test]
     fn chrono_now_produces_valid_format() {
         let ts = chrono_now();
         assert!(ts.ends_with('Z'));
         assert!(ts.contains('T'));
         assert_eq!(ts.len(), 20);
+    }
+
+    #[test]
+    fn format_utc_known_dates() {
+        assert_eq!(format_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_utc(951_782_400), "2000-02-29T00:00:00Z"); // leap day
+        assert_eq!(format_utc(1_709_164_800), "2024-02-29T00:00:00Z");
+        assert_eq!(format_utc(1_793_102_400), "2026-10-27T12:00:00Z");
+        assert_eq!(format_utc(4_102_444_799), "2099-12-31T23:59:59Z");
     }
 
     #[test]

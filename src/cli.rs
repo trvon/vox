@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 
 use crate::config::KokoroModel;
+use crate::recording::ExportFormat;
+use std::path::PathBuf;
 
 /// Lightweight voice MCP server with local Moonshine + Kokoro inference
 #[derive(Parser)]
@@ -35,6 +37,25 @@ pub enum Command {
         /// Kokoro model variant to download (defaults to configured kokoro_model)
         #[arg(long, value_enum)]
         kokoro_model: Option<KokoroModel>,
+    },
+    /// Transcribe an audio/video file locally (no daemon) and print an export.
+    /// WAV is read natively; other formats need ffmpeg. The job is also saved
+    /// under the recordings directory so MCP tools can reuse it.
+    Transcribe {
+        /// Audio file to transcribe
+        path: PathBuf,
+        /// Output format
+        #[arg(long, value_enum, default_value = "markdown")]
+        format: ExportFormat,
+        /// Write the export here instead of stdout
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Title for the transcript (default: file name)
+        #[arg(long)]
+        title: Option<String>,
+        /// Reference transcript (text file); prints word error rate to stderr
+        #[arg(long)]
+        reference: Option<PathBuf>,
     },
     /// Calibrate DSP parameters using a genetic algorithm on live audio
     Calibrate {
@@ -128,6 +149,74 @@ pub enum ToolAction {
         /// Silence duration in ms before end-of-turn
         #[arg(long, default_value = "2500")]
         silence_timeout_ms: u32,
+    },
+    /// Start a long-form recording (lecture/meeting) in the daemon
+    StartRecording {
+        #[arg(long)]
+        title: Option<String>,
+        /// Don't keep the audio file (transcript only)
+        #[arg(long)]
+        no_audio: bool,
+    },
+    /// Stop a recording and finalize its transcript
+    StopRecording {
+        /// Recording id (default: the active one)
+        #[arg(long)]
+        id: Option<String>,
+        /// Skip transcription of remaining audio (audio is kept)
+        #[arg(long)]
+        cancel: bool,
+        /// Return immediately instead of waiting for finalization
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Show recording / transcription job status
+    RecordingStatus {
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// Add a section marker to the active recording
+    MarkRecording {
+        #[arg(long)]
+        label: String,
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// List recordings and file transcriptions
+    ListRecordings {
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Transcribe an audio file in the daemon (background job)
+    TranscribeFile {
+        path: String,
+        #[arg(long)]
+        title: Option<String>,
+        /// Block until done
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Page through a transcript
+    GetTranscript {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        cursor: Option<u64>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Export a transcript (markdown/text/srt/vtt/json)
+    ExportTranscript {
+        #[arg(long)]
+        id: String,
+        #[arg(long, value_enum, default_value = "markdown")]
+        format: ExportFormat,
+        #[arg(long)]
+        paragraph_gap_secs: Option<f32>,
+        #[arg(long)]
+        section_minutes: Option<f32>,
+        #[arg(long)]
+        max_chars: Option<usize>,
     },
     /// Run DSP calibration via the daemon
     Calibrate {

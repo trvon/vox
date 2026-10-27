@@ -34,7 +34,8 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
-      - name: Check test compilation
-        run: cargo check --tests
+      # Model-free: unit tests, config integration, and proptest invariants.
+      - name: Test
+        run: cargo test

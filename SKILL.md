@@ -9,13 +9,13 @@ tags: [mcp, voice, tts, stt, rust]
 
 ## Project Overview
 
-Vox is a lightweight voice MCP server (~1,500 lines of Rust) providing local text-to-speech (Kokoro) and speech-to-text (Moonshine Base) via the MCP protocol. It runs as a stdio subprocess per MCP client, or as a shared HTTP daemon.
+Vox is a local voice MCP server in Rust providing local text-to-speech (Kokoro) and speech-to-text (Moonshine Base) via the MCP protocol. It runs as a stdio subprocess per MCP client, or as a shared HTTP daemon.
 
 ## Build & Test
 
 ```bash
 cargo check                    # type-check only
-cargo test                     # run all unit tests (84 tests across 10 modules)
+cargo test                     # unit + integration + proptest invariants
 cargo clippy -- -D warnings    # lint — must pass with zero warnings
 cargo build --release          # optimized build (LTO + single codegen unit)
 cargo bench -- resample        # benchmark resampling
@@ -30,7 +30,9 @@ All of `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` must
 | `main.rs` | Entry point, config loading, model download, stdio/daemon startup |
 | `cli.rs` | Clap CLI parser: daemon, config, download-models subcommands |
 | `server.rs` | MCP tool handlers (`say`, `listen`, `converse`), streaming TTS pipeline |
-| `tts.rs` | Kokoro TTS engine wrapper, voice name → speaker ID resolution, sentence splitting |
+| `tts.rs` | Kokoro TTS (official sherpa-onnx crate, pinned 1.13.8), voice resolution, sentence splitting |
+| `recording.rs` | Long-form recording / file transcription jobs, durable storage |
+| `transcript.rs` | Paragraphs, sections, markdown/SRT/VTT export, WER |
 | `audio.rs` | cpal-based mic capture and speaker playback, Lanczos-3 sinc resampling |
 | `stt.rs` | Moonshine Base STT engine wrapper |
 | `vad.rs` | Voice activity detection (Silero ONNX) |
@@ -61,6 +63,9 @@ CLI management: `vox config get [key]`, `vox config set <key> <value>`, `vox con
 | `say` | Speak text aloud through speakers (TTS only) |
 | `listen` | Record from microphone and transcribe (STT only) |
 | `converse` | Speak text then listen for response (TTS + STT round-trip) |
+| `start_recording` / `stop_recording` / `mark_recording` / `recording_status` | Long-form (lecture/meeting) recording with incremental timestamped transcription |
+| `transcribe_file` / `list_recordings` | Transcribe existing audio as a background job; list jobs |
+| `get_transcript` / `export_transcript` | Cursor-paged segments; transcript artifacts in Markdown, text, SRT, VTT, JSON (callers handle rewriting) |
 
 ## Available Voices
 
@@ -82,7 +87,7 @@ Default: `af_heart` (ID 0). Voices can be specified by name or numeric ID.
 ## Dev Workflow
 
 1. Make changes
-2. `cargo test` — verify all 84 tests pass
+2. `cargo test` — all tests pass
 3. `cargo clippy -- -D warnings` — zero warnings
 4. `cargo fmt --check` — formatting
 5. If touching `audio.rs` resampling: `cargo bench -- resample`
