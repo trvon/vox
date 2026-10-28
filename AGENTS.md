@@ -23,7 +23,7 @@ The first four must pass cleanly before submitting changes. Run `PROPTEST_CASES=
 | Module | Purpose |
 |--------|---------|
 | `main.rs` | Entry point, config loading, model download, stdio/daemon startup, `vox transcribe` |
-| `cli.rs` | Clap CLI parser: tool, daemon, config, transcribe, download-models subcommands |
+| `cli.rs` | Clap CLI parser: tool, daemon, service, config, transcribe, download-models subcommands |
 | `server.rs` | MCP tool handlers (thin layer over `VoiceRuntime`) |
 | `runtime.rs` | `VoiceRuntime`: shared voice state (TTS queue, inbox, background listener, recordings) |
 | `recording.rs` | Long-form recording + file transcription jobs: segmenter (VAD + ring buffer padding), STT worker, durable store (manifest/JSONL/WAV), paging, export |
@@ -36,6 +36,7 @@ The first four must pass cleanly before submitting changes. Run `PROPTEST_CASES=
 | `vad.rs` | Silero VAD wrapper: `VadOptions` (always sets `max_speech_secs`), absolute u64 segment start |
 | `config.rs` | TOML config loading, env var overrides (`VOX_*` prefix), path resolution |
 | `daemon.rs` | HTTP daemon lifecycle: daemonize, PID file, start/stop/status/log |
+| `service.rs` | Linux systemd user-unit install/uninstall (embedded `systemd/vox.service.in`); no model/audio startup |
 | `models.rs` | Model readiness checks and download/extraction |
 | `lib.rs` | Public modules for benches/tests/examples (`audio`, `calibrate`, `config`, `error`, `stt`, `transcript`, `tts`, `vad`) |
 | `error.rs` | `VoiceError` enum with `thiserror` derives |
@@ -44,6 +45,17 @@ The first four must pass cleanly before submitting changes. Run `PROPTEST_CASES=
 
 - **Stdio** (default): `rmcp::transport::stdio()`. One process per MCP client.
 - **Daemon** (`vox daemon start`): `StreamableHttpService` (rmcp 3.x). One process with models loaded once. **A single `VoiceRuntime` is shared by every session**: protocol `2026-07-28` is stateless (the factory may run once per request), and recordings and the TTS queue must survive reconnects, so never put state in `VoiceMcpServer`. Origin validation is enforced (browsers are rejected), because the daemon controls the microphone. On shutdown, running recordings are finalized.
+
+### Autostart installation
+
+`setup.sh` and persistent global npm installs enable the Linux user service by
+calling `vox service install`. Local/npm `npx` runs never install services;
+`VOX_NO_SERVICE=1` skips autostart. The unit must run `daemon start --foreground`,
+not daemonize under systemd/launchd. Use `systemctl --user` for managed lifecycle
+and `journalctl --user -u vox.service` for logs. Never overwrite custom/symlinked
+units or silently stop unmanaged daemons. Installer tests are model-free:
+`cargo test --test service_install`, `npm test --prefix npm`, and
+`python3 tests/setup_install.py`.
 
 ### Streaming TTS
 

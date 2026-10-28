@@ -121,16 +121,30 @@ sudo apk add pkgconf alsa-lib-dev
 Vox uses the official k2-fsa [`sherpa-onnx`](https://crates.io/crates/sherpa-onnx) crate. Its default `static` feature downloads a prebuilt archive at build time and links sherpa-onnx and onnxruntime into the `vox` binary, so there are no shared libraries to ship. For offline builds, point `SHERPA_ONNX_ARCHIVE_DIR` or `SHERPA_ONNX_LIB_DIR` at a local copy. The crate is pinned to **1.13.x**: version 2.0 removed espeak-ng, which makes Kokoro silently skip numbers and words missing from its lexicon.
 
 ```bash
-cargo install --path .
+cargo install --path . --locked
+# Linux: enable autostart after a manual cargo install
+vox service install
 ```
 
 #### Optional: guided setup
 
-`setup.sh` builds a release binary, installs it to `~/.local/bin` by default, downloads models, and (on macOS) configures a launchd agent for daemon mode.
+`setup.sh` builds a release binary, installs it to `~/.local/bin` by default,
+downloads models, and enables a per-user daemon: systemd on Linux, launchd on
+macOS. Run it as your desktop user, not with `sudo`.
 
 ```bash
 ./setup.sh
+# Custom permanent binary location:
+./setup.sh "$HOME/.local/bin"
+# Binary/models only (containers, CI, or manual lifecycle management):
+VOX_NO_SERVICE=1 ./setup.sh
 ```
+
+On Linux without an available systemd user manager, setup leaves the binary and
+models installed and prints the command to enable autostart from a login session.
+Persistent global npm installs (`npm install -g vox-mcp`) also attempt to enable
+the Linux service; `VOX_NO_SERVICE=1` opts out. Local npm installs and temporary
+`npx` invocations never install a login service.
 
 ### Model download options
 
@@ -196,12 +210,50 @@ Point clients at the daemon:
 }
 ```
 
+### Linux autostart (systemd user service)
+
+```bash
+# For an already-installed binary; enable at login and start/restart now:
+vox service install
+# Enable at login without starting now:
+vox service install --no-start
+systemctl --user status vox.service
+journalctl --user -u vox.service -f
+systemctl --user restart vox.service
+systemctl --user stop vox.service
+# Disable autostart and remove the generated unit; keep models/recordings:
+vox service uninstall
+```
+
+If a daemon was started manually, stop it with `vox daemon stop` before handing
+control to systemd. Once managed, use `systemctl --user` for lifecycle commands
+and the journal for logs, rather than `vox daemon start/restart/log`.
+
+The generated unit is `$XDG_CONFIG_HOME/systemd/user/vox.service` (normally
+`~/.config/systemd/user/vox.service`). It runs the installing binary's absolute
+path with `daemon start --foreground`, restarts on failure, and allows up to five
+minutes for graceful recording/transcription shutdown. It starts with your user
+manager at login, not as a privileged system service. No microphone capture starts
+until a client requests it. Initial startup downloads missing models if needed.
+`active` means the process is running, not that model initialization is finished;
+wait for `Vox MCP daemon listening` in the journal before connecting a client.
+
+Keep the binary at a permanent path. Re-run `vox service install` after moving
+it; npm users should run `vox-mcp service uninstall` before uninstalling the
+package. Custom or symlinked units are never overwritten or removed. Put overrides
+(e.g. `Environment=VOX_PORT=8080` under `[Service]`) in
+`systemctl --user edit vox.service`; the service reads your TOML config and user
+manager environment, not the installer's temporary shell environment. Logout
+normally stops the user manager; lingering is an explicit administrator/user
+choice, not enabled by the installer.
+
 ### Pi harness
 
-Use the shared daemon when more than one Pi session may use Vox. Install the
-binary using the manual instructions above, then start it with `vox daemon start`.
-The daemon remains available when a harness session disconnects; stop it explicitly
-with `vox daemon stop`.
+Use the shared daemon when more than one Pi session may use Vox. Linux installers
+can enable it with `vox service install`; otherwise start it with
+`vox daemon start`. The daemon remains available when a harness session
+disconnects. Stop managed daemons with `systemctl --user stop vox.service`, or
+manually started ones with `vox daemon stop`.
 
 With Pi's built-in MCP support:
 

@@ -4,7 +4,7 @@ const https = require("https");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
-const { execSync } = require("child_process");
+const { execFileSync } = require("child_process");
 
 const VERSION = require("./package.json").version;
 const REPO = "trvon/vox";
@@ -49,6 +49,43 @@ function download(url) {
   });
 }
 
+// Only persistent global installs opt into autostart. In particular, fetching
+// this package for an npx invocation must not create a login service.
+function maybeInstallService(voxBin, {
+  platform = process.platform,
+  env = process.env,
+  run = execFileSync,
+  warn = console.warn,
+} = {}) {
+  if (platform !== "linux" || env.npm_config_global !== "true" || env.VOX_NO_SERVICE === "1") {
+    return;
+  }
+  try {
+    run(voxBin, ["service", "install"], { stdio: "inherit" });
+  } catch {
+    // Headless/CI installs may have systemctl but no user manager. Do not turn
+    // an optional service failure into a failed binary installation.
+    warn("Vox binary installed, but autostart could not be enabled. From your login session run: vox-mcp service install (stop any manually started Vox daemon first).");
+  }
+}
+
+function installArchive(tarball, binDir, run = execFileSync) {
+  const staging = fs.mkdtempSync(path.join(path.dirname(binDir), ".vox-install-"));
+  try {
+    run("tar", ["xzf", tarball, "-C", staging], { stdio: "inherit" });
+    const executable = path.join(staging, "vox");
+    if (!fs.existsSync(executable)) throw new Error("Release archive is missing the vox binary");
+    fs.chmodSync(executable, 0o755);
+    fs.mkdirSync(binDir, { recursive: true });
+    // Rename rather than truncate a binary/shared library a daemon has mapped.
+    for (const name of fs.readdirSync(staging)) {
+      fs.renameSync(path.join(staging, name), path.join(binDir, name));
+    }
+  } finally {
+    fs.rmSync(staging, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   const artifact = getArtifactName();
   const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${artifact}`;
@@ -61,23 +98,21 @@ async function main() {
   const data = await download(url);
   fs.writeFileSync(tarball, data);
 
-  // Extract
-  fs.mkdirSync(binDir, { recursive: true });
-  execSync(`tar xzf "${tarball}" -C "${binDir}"`, { stdio: "inherit" });
-
-  // Cleanup tarball
-  fs.unlinkSync(tarball);
-
-  // Make binary executable
-  const voxBin = path.join(binDir, "vox");
-  if (fs.existsSync(voxBin)) {
-    fs.chmodSync(voxBin, 0o755);
+  try {
+    installArchive(tarball, binDir);
+  } finally {
+    fs.unlinkSync(tarball);
   }
 
+  maybeInstallService(path.join(binDir, "vox"));
   console.log("vox installed successfully.");
 }
 
-main().catch((err) => {
-  console.error("Installation failed:", err.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("Installation failed:", err.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { installArchive, maybeInstallService };

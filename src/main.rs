@@ -11,6 +11,7 @@ mod models;
 mod recording;
 mod runtime;
 mod server;
+mod service;
 mod stt;
 mod tool_client;
 mod transcript;
@@ -18,7 +19,7 @@ mod tts;
 mod vad;
 
 use clap::Parser;
-use cli::{Cli, Command, ConfigAction, DaemonAction, ToolAction};
+use cli::{Cli, Command, ConfigAction, DaemonAction, ServiceAction, ToolAction};
 use config::Config;
 use rmcp::ServiceExt;
 
@@ -66,6 +67,10 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
         .init();
 
     match cli.command {
+        Some(Command::Service { action }) => match action {
+            ServiceAction::Install { no_start } => service::install(no_start)?,
+            ServiceAction::Uninstall => service::uninstall()?,
+        },
         Some(Command::Config { action }) => {
             match action {
                 ConfigAction::Get { key: Some(key) } => match config.get_value(&key) {

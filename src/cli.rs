@@ -27,6 +27,11 @@ pub enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Install or remove the Linux systemd user service
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Get or set configuration values
     Config {
         #[command(subcommand)]
@@ -75,6 +80,18 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceAction {
+    /// Install and enable autostart at login; start/restart the daemon now
+    Install {
+        /// Enable autostart without starting or restarting the daemon now
+        #[arg(long)]
+        no_start: bool,
+    },
+    /// Stop, disable, and remove the generated service (retain models/recordings)
+    Uninstall,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -390,6 +407,31 @@ mod tests {
             cli.command,
             Some(Command::DownloadModels {
                 kokoro_model: Some(KokoroModel::Fp32V11)
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_service_install_and_uninstall() {
+        let cli = Cli::try_parse_from(["vox", "service", "install"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Service {
+                action: ServiceAction::Install { no_start: false }
+            })
+        ));
+        let cli = Cli::try_parse_from(["vox", "service", "install", "--no-start"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Service {
+                action: ServiceAction::Install { no_start: true }
+            })
+        ));
+        let cli = Cli::try_parse_from(["vox", "service", "uninstall"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Service {
+                action: ServiceAction::Uninstall
             })
         ));
     }

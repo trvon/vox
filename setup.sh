@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Vox setup script
 # Builds vox, installs binary + dylibs, downloads models, configures daemon
+# VOX_NO_SERVICE=1 skips launchd/systemd setup.
 
 INSTALL_DIR="${1:-${HOME}/.local/bin}"
 DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/vox"
@@ -34,11 +35,14 @@ if [[ "${OS}" == "Linux" ]]; then
 fi
 
 info "Building vox (release)..."
-cargo build --release
+cargo build --release --locked
 
 info "Installing binary to ${INSTALL_DIR}/"
 mkdir -p "${INSTALL_DIR}"
-cp target/release/vox "${INSTALL_DIR}/vox"
+# Rename over the old binary so a running daemon can finish using its inode.
+install -m 755 target/release/vox "${INSTALL_DIR}/.vox-install.$$"
+mv -f "${INSTALL_DIR}/.vox-install.$$" "${INSTALL_DIR}/vox"
+INSTALL_DIR="$(cd "${INSTALL_DIR}" && pwd)"
 
 # Copy all required shared libraries next to binary
 shopt -s nullglob
@@ -52,8 +56,18 @@ shopt -u nullglob
 info "Downloading models to ${DATA_DIR}/models/..."
 "${INSTALL_DIR}/vox" download-models
 
-# --- Daemon setup (macOS launchd) ---
-if [[ "${OS}" == "Darwin" ]]; then
+# --- Daemon setup (per-user, never a root/system service) ---
+if [[ "${VOX_NO_SERVICE:-0}" == "1" ]]; then
+    info "Skipping autostart service (VOX_NO_SERVICE=1)"
+elif [[ "${OS}" == "Linux" ]]; then
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user show --property=Version --value >/dev/null 2>&1; then
+        info "Installing systemd user service..."
+        "${INSTALL_DIR}/vox" service install
+    else
+        info "No systemd user manager available; binary and models are installed."
+        info "From a login session, enable autostart with: ${INSTALL_DIR}/vox service install"
+    fi
+elif [[ "${OS}" == "Darwin" ]]; then
     info "Installing launchd plist → ${PLIST_PATH}"
     mkdir -p "${PLIST_DIR}" "${DATA_DIR}"
 
@@ -73,6 +87,7 @@ if [[ "${OS}" == "Darwin" ]]; then
         <string>${INSTALL_DIR}/vox</string>
         <string>daemon</string>
         <string>start</string>
+        <string>--foreground</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -124,6 +139,7 @@ fi
 
 if [[ "${OS}" == "Linux" ]]; then
     echo ""
-    echo "Linux note: setup.sh does not install a service manager."
-    echo "  Start the daemon manually:  ${INSTALL_DIR}/vox daemon start"
+    echo "Service controls: systemctl --user {status,start,stop,restart} vox.service"
+    echo "Logs: journalctl --user -u vox.service"
+    echo "Without a service: ${INSTALL_DIR}/vox daemon start"
 fi
