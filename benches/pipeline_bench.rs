@@ -34,6 +34,17 @@ fn bench_streaming_resampler(c: &mut Criterion) {
     g.finish();
 }
 
+/// Include coefficient-table construction/destruction separately from streaming.
+fn bench_resampler_setup(c: &mut Criterion) {
+    let mut g = c.benchmark_group("resampler_setup_and_drop");
+    for rate in [48_000u32, 44_100, 24_000, 16_001] {
+        g.bench_function(format!("{rate}_to_16k"), |b| {
+            b.iter(|| StreamingResampler::new(black_box(rate), black_box(16_000)))
+        });
+    }
+    g.finish();
+}
+
 /// A 3-hour lecture: ~2,000 segments, a marker every 20 minutes.
 fn lecture_segments() -> (Vec<TranscriptSegment>, Vec<Marker>) {
     let segs = (0..2_000u64)
@@ -87,5 +98,10 @@ fn bench_transcript_export(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_streaming_resampler, bench_transcript_export);
+criterion_group!(
+    benches,
+    bench_streaming_resampler,
+    bench_resampler_setup,
+    bench_transcript_export
+);
 criterion_main!(benches);
