@@ -570,6 +570,52 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
+// Bound each instance's coefficient table to 64 KiB (plus phase denominators).
+// Common audio ratios fit; unusual co-prime rates retain the scalar LUT path.
+const MAX_POLYPHASE_COEFFICIENTS: usize = 8_192;
+
+struct PolyphaseKernel {
+    weights: Box<[f64]>,
+    weight_sums: Box<[f64]>,
+    taps: usize,
+}
+
+impl PolyphaseKernel {
+    fn new(phases: u64, scale: f64, half_width: i64) -> Option<Self> {
+        let phases = usize::try_from(phases).ok()?;
+        let taps = usize::try_from(half_width).ok()?.checked_mul(2)?;
+        let coefficient_count = phases.checked_mul(taps)?;
+        if coefficient_count > MAX_POLYPHASE_COEFFICIENTS {
+            return None;
+        }
+        let mut weights = Vec::with_capacity(coefficient_count);
+        let mut weight_sums = Vec::with_capacity(phases);
+        for phase in 0..phases {
+            let frac = phase as f64 / phases as f64;
+            let mut weight_sum = 0.0;
+            for offset in -half_width + 1..=half_width {
+                let weight = lanczos3_table(((-offset) as f64 + frac) * scale);
+                weights.push(weight);
+                weight_sum += weight;
+            }
+            weight_sums.push(weight_sum);
+        }
+        Some(Self {
+            weights: weights.into_boxed_slice(),
+            weight_sums: weight_sums.into_boxed_slice(),
+            taps,
+        })
+    }
+
+    fn phase(&self, phase: usize) -> (&[f64], f64) {
+        let start = phase * self.taps;
+        (
+            &self.weights[start..start + self.taps],
+            self.weight_sums[phase],
+        )
+    }
+}
+
 /// Stateful Lanczos-3 windowed-sinc resampler for streaming audio.
 ///
 /// - **Anti-aliased**: when downsampling, the kernel is stretched by
@@ -587,6 +633,7 @@ pub struct StreamingResampler {
     to: u64,
     scale: f64,
     half_width: i64,
+    kernel: Option<PolyphaseKernel>,
     buf: Vec<f32>,
     /// Absolute source index of `buf[0]`.
     base: u64,
@@ -609,6 +656,9 @@ impl StreamingResampler {
             to,
             scale,
             half_width,
+            kernel: (from != to)
+                .then(|| PolyphaseKernel::new(to, scale, half_width))
+                .flatten(),
             buf: Vec::new(),
             base: 0,
             next_out: 0,
@@ -625,9 +675,9 @@ impl StreamingResampler {
     }
 
     #[inline]
-    fn position(&self, k: u64) -> (u64, f64) {
+    fn position(&self, k: u64) -> (u64, u64) {
         let num = k * self.from;
-        (num / self.to, (num % self.to) as f64 / self.to as f64)
+        (num / self.to, num % self.to)
     }
 
     /// One output sample. Taps outside the available input (stream start, or
@@ -636,20 +686,43 @@ impl StreamingResampler {
     /// ringing (up to ~2.8x at the last sample), while edge extension keeps
     /// DC exact and overshoot at interior levels.
     #[inline]
-    fn compute(&self, ip: u64, frac: f64, end: u64) -> f32 {
+    fn compute(&self, ip: u64, phase: u64, end: u64) -> f32 {
         let lo = ip as i64 - self.half_width + 1;
         let hi = ip as i64 + self.half_width;
         let first = self.base as i64;
         let last = end as i64 - 1;
-        let mut sum = 0.0_f64;
-        let mut weight_sum = 0.0_f64;
-        for j in lo..=hi {
-            let x = (ip as i64 - j) as f64 + frac;
-            let w = lanczos3_table(x * self.scale);
-            let idx = j.clamp(first, last);
-            sum += self.buf[(idx - first) as usize] as f64 * w;
-            weight_sum += w;
-        }
+        let (sum, weight_sum) = if let Some(kernel) = &self.kernel {
+            let (weights, weight_sum) = kernel.phase(phase as usize);
+            let mut sum = 0.0_f64;
+            if lo >= first && hi <= last {
+                // Most samples use contiguous input, with no per-tap clamping
+                // or coefficient interpolation. Keep the scalar accumulation
+                // order and final division identical to the fallback.
+                let start = (lo - first) as usize;
+                for (&sample, &weight) in self.buf[start..start + weights.len()].iter().zip(weights)
+                {
+                    sum += sample as f64 * weight;
+                }
+            } else {
+                for (offset, &weight) in weights.iter().enumerate() {
+                    let idx = (lo + offset as i64).clamp(first, last);
+                    sum += self.buf[(idx - first) as usize] as f64 * weight;
+                }
+            }
+            (sum, weight_sum)
+        } else {
+            let frac = phase as f64 / self.to as f64;
+            let mut sum = 0.0_f64;
+            let mut weight_sum = 0.0_f64;
+            for j in lo..=hi {
+                let x = (ip as i64 - j) as f64 + frac;
+                let w = lanczos3_table(x * self.scale);
+                let idx = j.clamp(first, last);
+                sum += self.buf[(idx - first) as usize] as f64 * w;
+                weight_sum += w;
+            }
+            (sum, weight_sum)
+        };
         if weight_sum.abs() > 1e-10 {
             (sum / weight_sum) as f32
         } else {
@@ -666,11 +739,11 @@ impl StreamingResampler {
         self.buf.extend_from_slice(input);
         let end = self.base + self.buf.len() as u64;
         loop {
-            let (ip, frac) = self.position(self.next_out);
+            let (ip, phase) = self.position(self.next_out);
             if ip as i64 + self.half_width >= end as i64 {
                 break;
             }
-            out.push(self.compute(ip, frac, end));
+            out.push(self.compute(ip, phase, end));
             self.next_out += 1;
         }
         // Drop input no future output can reach.
@@ -689,11 +762,11 @@ impl StreamingResampler {
         }
         let end = self.base + self.buf.len() as u64;
         loop {
-            let (ip, frac) = self.position(self.next_out);
+            let (ip, phase) = self.position(self.next_out);
             if ip >= end {
                 break;
             }
-            out.push(self.compute(ip, frac, end));
+            out.push(self.compute(ip, phase, end));
             self.next_out += 1;
         }
         self.buf.clear();
@@ -781,6 +854,73 @@ mod tests {
         assert_eq!(handle.finish(), 1536);
         assert_eq!(handle.finish(), 1536); // Idempotent.
         assert!(coordinator.acquire().is_ok());
+    }
+
+    #[test]
+    fn polyphase_matches_scalar_fallback_bit_for_bit() {
+        let rates = [8_000, 16_000, 22_050, 24_000, 44_100, 48_000];
+        for from in rates {
+            for to in rates {
+                for len in [0, 1, 2, 17, 257] {
+                    let input: Vec<f32> = (0..len)
+                        .map(|i| ((i * 73 + 19) % 251) as f32 / 125.0 - 1.0)
+                        .collect();
+                    let mut scalar = StreamingResampler::new(from, to);
+                    scalar.kernel = None;
+                    let mut expected = Vec::new();
+                    scalar.process(&input, &mut expected);
+                    scalar.flush(&mut expected);
+                    let expected_bits: Vec<_> = expected.into_iter().map(f32::to_bits).collect();
+                    for chunk_size in [1, 7, 128] {
+                        let mut cached = StreamingResampler::new(from, to);
+                        let mut actual = Vec::new();
+                        for chunk in input.chunks(chunk_size) {
+                            cached.process(chunk, &mut actual);
+                        }
+                        cached.flush(&mut actual);
+                        let actual_bits: Vec<_> = actual.into_iter().map(f32::to_bits).collect();
+                        assert_eq!(
+                            actual_bits, expected_bits,
+                            "{from}->{to}, len={len}, chunk={chunk_size}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uncommon_ratio_fallback_remains_chunk_invariant() {
+        let input: Vec<f32> = (0..2_003).map(|i| (i as f32 * 0.17).sin()).collect();
+        let mut fallback = StreamingResampler::new(16_000, 16_001);
+        assert!(fallback.kernel.is_none());
+        let expected = resample(&input, 16_000, 16_001);
+        let mut actual = Vec::new();
+        for chunk in input.chunks(13) {
+            fallback.process(chunk, &mut actual);
+        }
+        fallback.flush(&mut actual);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), fallback.expected_len(input.len()));
+    }
+
+    #[test]
+    fn polyphase_cache_is_bounded_and_passthrough_needs_none() {
+        for (from, to) in [(48_000, 16_000), (44_100, 16_000), (16_000, 44_100)] {
+            let rs = StreamingResampler::new(from, to);
+            let kernel = rs.kernel.as_ref().unwrap();
+            assert!(kernel.weights.len() <= MAX_POLYPHASE_COEFFICIENTS);
+            assert!(
+                kernel
+                    .weight_sums
+                    .iter()
+                    .all(|w| w.is_finite() && w.abs() > 1e-10)
+            );
+        }
+        assert!(StreamingResampler::new(16_000, 16_000).kernel.is_none());
+        for (from, to) in [(16_000, 16_001), (1, u32::MAX), (u32::MAX, 1)] {
+            assert!(StreamingResampler::new(from, to).kernel.is_none());
+        }
     }
 
     #[test]

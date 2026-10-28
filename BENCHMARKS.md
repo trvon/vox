@@ -99,6 +99,80 @@ and prompt daemon shutdown. No microphone capture or speaker playback was used.
 - `scripts/profile.sh samply [file]` gives a Firefox-profiler UI if `samply` is installed.
 - Per-job STT speed is always available: `recording_status` / `list_recordings` report `stt_rtf`, `speech_ms` and `stt_compute_ms`.
 
+## Bounded polyphase optimization (2026-10-28)
+
+Measured on the same i7-1260P Linux host, with Rust 1.95 release settings and no
+native-CPU flags. The baseline is commit `ea180ee`; the optimization is on the
+separate `perf/polyphase-resampler` branch. These measurements compare against a
+fresh retained baseline, **not** the historical M4 or heavily loaded numbers
+above. CPU affinity/governor were not changed.
+
+The resampler now caches raw f64 weights and their sums for each rational phase,
+then uses contiguous input for interior dot products. Accumulation order, final
+division, edge extension, sample positions, and scalar LUT fallback are retained.
+No unsafe SIMD, model quantization changes, or sherpa/ONNX rebuild is involved.
+The coefficient array is capped at 8,192 f64 values (64 KiB), plus per-phase sums;
+unusual ratios fall back rather than allocate an unbounded phase table.
+
+### Streaming cost
+
+One second of audio in 10 ms chunks, including construction/flush/destruction.
+Criterion means from 60 samples, 2 s warmup and 4 s measurement; the optimized
+range covers two independent runs:
+
+| Conversion | Before | After (two runs) | Speedup |
+| --- | ---: | ---: | ---: |
+| 48,000 → 16,000 Hz | 1.484 ms | 0.183–0.184 ms | 8.1× |
+| 44,100 → 16,000 Hz | 1.489 ms | 0.199–0.222 ms | 6.7–7.5× |
+
+The separate `resampler_setup_and_drop` group makes table-construction cost
+visible: about 0.12 µs at 48/24 kHz input and 13.7 µs at 44.1 kHz, once per
+resampler instance. The 44.1 → 16 kHz table uses 23.75 KiB for weights and sums.
+Benchmark load averages were approximately 1.0 before and 2.8–3.7 afterward;
+these are same-host measurements, not portable speed guarantees.
+
+```bash
+# Before modifying audio.rs, retain a named baseline:
+cargo bench --bench pipeline_bench -- streaming_resample_1s \
+  --save-baseline pre-polyphase-ea180ee --sample-size 60 --warm-up-time 2 --measurement-time 4
+# After the change:
+cargo bench --bench pipeline_bench -- streaming_resample_1s \
+  --baseline pre-polyphase-ea180ee --sample-size 60 --warm-up-time 2 --measurement-time 4
+cargo bench --bench pipeline_bench -- resampler_setup_and_drop
+```
+
+### Whole-file behavior
+
+Five alternating baseline/optimized process pairs transcribed the **same retained
+76.5 s fixture**, with Moonshine Base and one STT thread. The order reverses on
+alternate pairs. Process wall time includes model loading; Python `wait4`
+accounts for per-process CPU/RSS. Host load varied from 7.6 to 10.4 during these
+runs.
+
+- Every run produced the same 12 segments and identical `transcript.jsonl` bytes
+  (SHA-256 `5de219a5a803628263c2d82e02b39f128c57e11f97ffc363a10dd7ce6aeb7131`).
+- WER remained **8.53%**, 11 edits / 129 reference words. This is a correctness
+  check on one synthetic fixture, not real-lecture acceptance evidence.
+- Median process wall time: **3.354 s before, 3.324 s after**. Median paired wall
+  change was only **−0.25%**, with pairs ranging from −1.94% to +2.97%:
+  **no reliable end-to-end latency improvement is demonstrated**.
+- Median process user CPU: 2.956 s before, 2.901 s after. These few runs do not
+  establish a general battery or memory improvement.
+- Separate one-thread profiles attributed approximately 2.03% of sampled CPU to
+  resampler `compute` before, 0.27% afterward. FMA/AVX-VNNI neural kernels still
+  dominate; thread spinning is no longer a dominant cost.
+
+Validation: 368 model-free Rust tests passed (one opt-in model test ignored),
+all 19 release invariant tests passed with `PROPTEST_CASES=2560`, and all 29 audio
+regressions passed in release mode. Cached/scalar comparison tests cover 36 rate
+pairs, five input lengths and three chunk sizes, plus uncommon-rate and
+allocation-bound regressions.
+
+Raw measurements, retained binaries/source, fixture copies, perf reports and
+paired logs are under
+`~/.local/state/vox/optimization/polyphase-20261028T001911Z/` on the measurement
+host. Audio/reference hashes are the same as the correctness fixture above.
+
 ## Notes
 
 - Results are saved to `target/criterion/` with HTML reports.
