@@ -27,6 +27,11 @@ jobs:
         with:
           cache-on-failure: true
 
+      # sherpa-onnx-sys caches absolute native-library paths, while rust-cache
+      # may omit target/sherpa-onnx-prebuilt. Rerun discovery after restoration.
+      - name: Refresh sherpa native library discovery
+        run: cargo clean --package sherpa-onnx-sys
+
       - name: Install Linux deps
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libclang-dev
 
@@ -41,7 +46,7 @@ jobs:
         run: cargo test
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Test npm installer
         run: npm test --prefix npm
       - name: Test source installer
