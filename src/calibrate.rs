@@ -1,6 +1,6 @@
 use crate::audio;
 use crate::config::{Config, DspConfig};
-use crate::vad::{VAD_WINDOW_SIZE, VadSession};
+use crate::vad::{VAD_WINDOW_SIZE, VadOptions, VadSession};
 
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -572,12 +572,18 @@ pub struct CalibrationResult {
 /// This dramatically improves the speech/silence RMS ratio in noisy environments.
 fn vad_filter_speech(config: &Config, raw: &[f32]) -> eyre::Result<Vec<f32>> {
     let duration_secs = raw.len() as f32 / SAMPLE_RATE as f32;
-    let mut vad =
-        VadSession::new(config, duration_secs).map_err(|e| eyre::eyre!("VAD init failed: {e}"))?;
+    let mut vad = VadSession::new(
+        config,
+        VadOptions {
+            buffer_secs: duration_secs.max(60.0),
+            ..VadOptions::default()
+        },
+    )
+    .map_err(|e| eyre::eyre!("VAD init failed: {e}"))?;
 
     for chunk in raw.chunks(VAD_WINDOW_SIZE) {
         if chunk.len() == VAD_WINDOW_SIZE {
-            vad.accept_waveform(chunk.to_vec());
+            vad.accept_waveform(chunk);
         }
     }
     vad.flush();

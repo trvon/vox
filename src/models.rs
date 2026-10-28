@@ -7,6 +7,7 @@ use tokio::io::AsyncWriteExt;
 const VAD_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
 
+#[cfg(test)]
 const MOONSHINE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-int8.tar.bz2";
 
 const KOKORO_INT8_V1_1_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_1.tar.bz2";
@@ -26,19 +27,26 @@ pub fn models_ready(config: &Config) -> bool {
 
 /// Check if all required models are present for a selected Kokoro variant.
 pub fn models_ready_with_variant(config: &Config, kokoro_model: KokoroModel) -> bool {
-    let moonshine_dir = config.moonshine_dir();
     let kokoro_dir = config.model_dir.join(kokoro_model.model_dir_name());
-    let vad_path = config.vad_model_path();
-
-    vad_path.exists()
-        && moonshine_dir.join("preprocess.onnx").exists()
-        && moonshine_dir.join("encode.int8.onnx").exists()
-        && moonshine_dir.join("uncached_decode.int8.onnx").exists()
-        && moonshine_dir.join("cached_decode.int8.onnx").exists()
-        && moonshine_dir.join("tokens.txt").exists()
+    transcription_models_ready(config)
         && kokoro_dir.join(kokoro_model.model_file_name()).exists()
         && kokoro_dir.join("voices.bin").exists()
         && kokoro_dir.join("tokens.txt").exists()
+}
+
+/// File transcription needs VAD + STT only, never Kokoro assets.
+pub fn transcription_models_ready(config: &Config) -> bool {
+    config.vad_model_path().is_file() && stt_model_ready(config)
+}
+
+/// Whether every file of the configured STT model is present.
+pub fn stt_model_ready(config: &Config) -> bool {
+    let dir = config.stt_dir();
+    config
+        .stt_model
+        .required_files()
+        .iter()
+        .all(|f| dir.join(f).exists())
 }
 
 /// Download all required models
@@ -51,6 +59,18 @@ pub async fn download_models_with_variant(
     config: &Config,
     kokoro_model: KokoroModel,
 ) -> Result<()> {
+    download_transcription_models(config).await?;
+    let kokoro_dir = config.model_dir.join(kokoro_model.model_dir_name());
+    if !kokoro_dir.join(kokoro_model.model_file_name()).exists() {
+        download_and_extract_tar_bz2(kokoro_download_url(kokoro_model), &config.model_dir).await?;
+    } else {
+        eprintln!("  Kokoro model ({kokoro_model}) already exists, skipping");
+    }
+    Ok(())
+}
+
+/// Download only the assets used by file transcription.
+pub async fn download_transcription_models(config: &Config) -> Result<()> {
     std::fs::create_dir_all(&config.model_dir)
         .map_err(|e| VoiceError::Download(format!("Failed to create model dir: {e}")))?;
 
@@ -62,20 +82,15 @@ pub async fn download_models_with_variant(
         eprintln!("  VAD model already exists, skipping");
     }
 
-    // Download Moonshine model
-    let moonshine_dir = config.moonshine_dir();
-    if !moonshine_dir.join("preprocess.onnx").exists() {
-        download_and_extract_tar_bz2(MOONSHINE_URL, &config.model_dir).await?;
+    // Download the configured STT model
+    if !stt_model_ready(config) {
+        eprintln!("  Downloading STT model {}", config.stt_model);
+        download_and_extract_tar_bz2(&config.stt_model.archive_url(), &config.model_dir).await?;
     } else {
-        eprintln!("  Moonshine model already exists, skipping");
-    }
-
-    // Download Kokoro TTS model
-    let kokoro_dir = config.model_dir.join(kokoro_model.model_dir_name());
-    if !kokoro_dir.join(kokoro_model.model_file_name()).exists() {
-        download_and_extract_tar_bz2(kokoro_download_url(kokoro_model), &config.model_dir).await?;
-    } else {
-        eprintln!("  Kokoro model ({kokoro_model}) already exists, skipping");
+        eprintln!(
+            "  STT model ({}) already exists, skipping",
+            config.stt_model
+        );
     }
 
     Ok(())
@@ -244,6 +259,19 @@ mod tests {
             model_dir: model_dir.to_path_buf(),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn transcription_readiness_does_not_require_tts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        fs::write(config.vad_model_path(), b"dummy").unwrap();
+        fs::create_dir_all(config.stt_dir()).unwrap();
+        for file in config.stt_model.required_files() {
+            fs::write(config.stt_dir().join(file), b"dummy").unwrap();
+        }
+        assert!(transcription_models_ready(&config));
+        assert!(!models_ready(&config));
     }
 
     #[test]

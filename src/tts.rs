@@ -1,7 +1,13 @@
 use crate::config::{Config, KokoroModel};
 use crate::error::{Result, VoiceError};
-use std::ffi::CString;
-use std::ptr::null;
+use sherpa_onnx::{
+    GenerationConfig, OfflineTts, OfflineTtsConfig, OfflineTtsKokoroModelConfig,
+    OfflineTtsModelConfig,
+};
+use std::borrow::Cow;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 
 /// Voice name to speaker ID mapping for Kokoro
 /// Full list at: https://github.com/k2-fsa/sherpa-onnx/blob/master/scripts/kokoro/voices.txt
@@ -34,7 +40,7 @@ const VOICE_MAP: &[(&str, i32)] = &[
     ("bm_lewis", 25),
 ];
 
-/// TTS audio output (matches sherpa-rs TtsAudio interface)
+/// TTS audio output
 #[derive(Debug)]
 pub struct TtsAudio {
     pub samples: Vec<f32>,
@@ -42,44 +48,76 @@ pub struct TtsAudio {
 }
 
 pub struct TtsEngine {
-    tts: *const sherpa_rs_sys::SherpaOnnxOfflineTts,
+    tts: OfflineTts,
     sample_rate: u32,
     kokoro_model: KokoroModel,
     default_voice: String,
     default_speed: f32,
 }
 
-fn cstring(s: &str) -> CString {
-    CString::new(s).unwrap_or_else(|_| CString::new("").unwrap())
+/// sherpa-onnx's safe API builds a `CString` from the text and panics on an
+/// interior NUL, so strip them before handing text over.
+fn sanitize_text(text: &str) -> Cow<'_, str> {
+    if text.contains('\0') {
+        Cow::Owned(text.replace('\0', " "))
+    } else {
+        Cow::Borrowed(text)
+    }
 }
+
+fn generation_config(sid: i32, speed: f32) -> GenerationConfig {
+    GenerationConfig {
+        sid,
+        speed,
+        // 1.0 = keep model pauses as-is (matches the pre-2.0 `silence_scale: 1.0`).
+        silence_scale: 1.0,
+        ..Default::default()
+    }
+}
+
+/// Forward one synthesized chunk to the consumer.
+/// Returns `true` to continue synthesis, `false` to stop (receiver dropped).
+/// (sherpa-onnx maps this to the C convention 1 = continue, 0 = stop.)
+pub(crate) fn forward_chunk(tx: &Sender<Vec<f32>>, samples: &[f32]) -> bool {
+    if samples.is_empty() {
+        return true; // continue, just skip empty chunk
+    }
+    tx.send(samples.to_vec()).is_ok()
+}
+
+type NoCallback = fn(&[f32], f32) -> bool;
 
 impl TtsEngine {
     pub fn new(config: &Config) -> Result<Self> {
         let kokoro_dir = config.kokoro_dir();
+        let path = |name: &str| kokoro_dir.join(name).to_string_lossy().into_owned();
 
-        let lexicon_us = kokoro_dir.join("lexicon-us-en.txt");
-        let lexicon_zh = kokoro_dir.join("lexicon-zh.txt");
+        let lexicon_parts: Vec<String> = ["lexicon-us-en.txt", "lexicon-zh.txt"]
+            .into_iter()
+            .filter(|name| kokoro_dir.join(name).exists())
+            .map(path)
+            .collect();
 
-        let mut lexicon_parts = Vec::new();
-        if lexicon_us.exists() {
-            lexicon_parts.push(lexicon_us.to_string_lossy().to_string());
+        // espeak-ng-data is the out-of-lexicon G2P fallback (numbers, names, rare
+        // words). sherpa-onnx 2.x removed espeak-ng and silently *skips* OOV words,
+        // which is why vox pins sherpa-onnx 1.13.x — see Cargo.toml.
+        let espeak_dir = kokoro_dir.join("espeak-ng-data");
+        if !espeak_dir.is_dir() {
+            return Err(VoiceError::Tts(format!(
+                "Kokoro espeak-ng-data not found at {} (re-run `vox download-models`)",
+                espeak_dir.display()
+            )));
         }
-        if lexicon_zh.exists() {
-            lexicon_parts.push(lexicon_zh.to_string_lossy().to_string());
+
+        let model_path = kokoro_dir.join(config.kokoro_model.model_file_name());
+        if !model_path.exists() {
+            return Err(VoiceError::Tts(format!(
+                "Kokoro model not found at {}",
+                model_path.display()
+            )));
         }
 
-        let model = cstring(
-            &kokoro_dir
-                .join(config.kokoro_model.model_file_name())
-                .to_string_lossy(),
-        );
-        let voices = cstring(&kokoro_dir.join("voices.bin").to_string_lossy());
-        let tokens = cstring(&kokoro_dir.join("tokens.txt").to_string_lossy());
-        let data_dir = cstring(&kokoro_dir.join("espeak-ng-data").to_string_lossy());
-        let dict_dir = cstring(&kokoro_dir.join("dict").to_string_lossy());
-        let lexicon = cstring(&lexicon_parts.join(","));
-        let provider = cstring("cpu");
-        let lang = cstring("");
+        let dict_dir = kokoro_dir.join("dict");
 
         // Determine thread count: config > env > default
         let num_threads = config
@@ -91,59 +129,46 @@ impl TtsEngine {
             })
             .unwrap_or(2); // Default 2 for better latency on most modern CPUs
 
-        let tts = unsafe {
-            let config = sherpa_rs_sys::SherpaOnnxOfflineTtsConfig {
-                model: sherpa_rs_sys::SherpaOnnxOfflineTtsModelConfig {
-                    vits: std::mem::zeroed(),
-                    num_threads,
-                    debug: 0,
-                    provider: provider.as_ptr(),
-                    matcha: std::mem::zeroed(),
-                    kokoro: sherpa_rs_sys::SherpaOnnxOfflineTtsKokoroModelConfig {
-                        model: model.as_ptr(),
-                        voices: voices.as_ptr(),
-                        tokens: tokens.as_ptr(),
-                        data_dir: data_dir.as_ptr(),
-                        length_scale: 1.0,
-                        dict_dir: dict_dir.as_ptr(),
-                        lexicon: lexicon.as_ptr(),
-                        lang: lang.as_ptr(),
-                    },
-                    kitten: std::mem::zeroed(),
+        let tts_config = OfflineTtsConfig {
+            model: OfflineTtsModelConfig {
+                kokoro: OfflineTtsKokoroModelConfig {
+                    model: Some(model_path.to_string_lossy().into_owned()),
+                    voices: Some(path("voices.bin")),
+                    tokens: Some(path("tokens.txt")),
+                    data_dir: Some(espeak_dir.to_string_lossy().into_owned()),
+                    length_scale: 1.0,
+                    dict_dir: dict_dir
+                        .exists()
+                        .then(|| dict_dir.to_string_lossy().into_owned()),
+                    lexicon: (!lexicon_parts.is_empty()).then(|| lexicon_parts.join(",")),
+                    lang: None,
                 },
-                rule_fsts: null(),
-                max_num_sentences: 1,
-                rule_fars: null(),
-                silence_scale: 1.0,
-            };
-
-            sherpa_rs_sys::SherpaOnnxCreateOfflineTts(&config)
+                num_threads,
+                debug: false,
+                provider: Some("cpu".to_string()),
+                ..Default::default()
+            },
+            rule_fsts: None,
+            max_num_sentences: 1,
+            rule_fars: None,
+            silence_scale: 1.0,
         };
 
-        if tts.is_null() {
-            return Err(VoiceError::Tts("Failed to create TTS engine".to_string()));
-        }
+        let tts = OfflineTts::create(&tts_config)
+            .ok_or_else(|| VoiceError::Tts("Failed to create TTS engine".to_string()))?;
 
-        let sample_rate = unsafe { sherpa_rs_sys::SherpaOnnxOfflineTtsSampleRate(tts) } as u32;
+        let sample_rate = tts.sample_rate() as u32;
 
-        // Warm up with the actual voice/speed we'll use (streaming path)
-        // This ensures the model cache is hot for real synthesis
-        unsafe {
-            let sid = resolve_voice_id(&config.voice);
-            let speed = config.speed;
-
-            // First: batch warmup (cheap)
-            let warmup_text = cstring(".");
-            let warmup_ptr =
-                sherpa_rs_sys::SherpaOnnxOfflineTtsGenerate(tts, warmup_text.as_ptr(), sid, speed);
-            if !warmup_ptr.is_null() {
-                sherpa_rs_sys::SherpaOnnxDestroyOfflineTtsGeneratedAudio(warmup_ptr);
-            }
-
-            // Second: streaming warmup (warms callback path)
-            let (tx, _rx) = std::sync::mpsc::channel::<Vec<f32>>();
-            streaming_warmup(tts, sid, speed, &tx);
-        }
+        // Warm up with the actual voice/speed we'll use (batch + streaming path)
+        // so the ONNX Runtime session is hot for the first real request.
+        let gen_config = generation_config(resolve_voice_id(&config.voice), config.speed);
+        let _ = tts.generate_with_config::<NoCallback>("hi", &gen_config, None);
+        let (tx, _rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let _ = tts.generate_with_config(
+            "hi",
+            &gen_config,
+            Some(move |samples: &[f32], _progress: f32| forward_chunk(&tx, samples)),
+        );
 
         tracing::debug!(
             sample_rate,
@@ -190,37 +215,28 @@ impl TtsEngine {
             "Synthesizing speech"
         );
 
-        let c_text = cstring(text);
+        let text = sanitize_text(text);
+        let audio = self
+            .tts
+            .generate_with_config::<NoCallback>(&text, &generation_config(sid, speed), None)
+            .ok_or_else(|| VoiceError::Tts("Synthesis returned null".to_string()))?;
 
-        unsafe {
-            let audio_ptr =
-                sherpa_rs_sys::SherpaOnnxOfflineTtsGenerate(self.tts, c_text.as_ptr(), sid, speed);
-
-            if audio_ptr.is_null() {
-                return Err(VoiceError::Tts("Synthesis returned null".to_string()));
-            }
-
-            let audio = audio_ptr.read();
-
-            if audio.n <= 0 || audio.samples.is_null() {
-                sherpa_rs_sys::SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio_ptr);
-                return Err(VoiceError::Tts("No audio samples generated".to_string()));
-            }
-
-            let samples = std::slice::from_raw_parts(audio.samples, audio.n as usize).to_vec();
-            let sample_rate = audio.sample_rate as u32;
-
-            sherpa_rs_sys::SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio_ptr);
-
-            Ok(TtsAudio {
-                samples,
-                sample_rate,
-            })
+        let samples = audio.samples();
+        if samples.is_empty() {
+            return Err(VoiceError::Tts("No audio samples generated".to_string()));
         }
+
+        Ok(TtsAudio {
+            samples: samples.to_vec(),
+            sample_rate: audio.sample_rate() as u32,
+        })
     }
 
     /// Synthesize text with streaming callback — audio chunks are sent through `tx`
     /// as they are generated by the C library. Returns the sample rate.
+    ///
+    /// sherpa-onnx splits the text into sentence-sized chunks internally and fires
+    /// the callback once per chunk; synthesis stops early if the receiver is dropped.
     ///
     /// The callback runs on the same thread as the C synthesis call, so this method
     /// must be called from a blocking context (e.g. `spawn_blocking`).
@@ -229,35 +245,34 @@ impl TtsEngine {
         text: &str,
         sid: i32,
         speed: f32,
-        tx: std::sync::mpsc::Sender<Vec<f32>>,
+        tx: Sender<Vec<f32>>,
     ) -> Result<u32> {
         tracing::debug!(sid, speed, text_len = text.len(), "Streaming synthesis");
-
-        let c_text = cstring(text);
-
-        unsafe {
-            let arg = &tx as *const std::sync::mpsc::Sender<Vec<f32>> as *mut std::ffi::c_void;
-
-            let audio_ptr = sherpa_rs_sys::SherpaOnnxOfflineTtsGenerateWithCallbackWithArg(
-                self.tts,
-                c_text.as_ptr(),
-                sid,
-                speed,
-                Some(streaming_callback),
-                arg,
-            );
-
-            // The callback has already streamed chunks through tx.
-            // We still get the full audio back — just clean it up.
-            if !audio_ptr.is_null() {
-                sherpa_rs_sys::SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio_ptr);
-            }
-        }
-
-        // Drop the sender so the receiver knows we're done
-        drop(tx);
-
+        self.stream_one(text, sid, speed, tx);
         Ok(self.sample_rate)
+    }
+
+    /// Run one streaming generation. Returns `false` if the receiver hung up
+    /// (synthesis was stopped early).
+    fn stream_one(&self, text: &str, sid: i32, speed: f32, tx: Sender<Vec<f32>>) -> bool {
+        let text = sanitize_text(text);
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_cb = Arc::clone(&alive);
+        // The returned full-utterance buffer is dropped immediately; chunks were
+        // already delivered through `tx`. The closure (and `tx`) is dropped when
+        // generation returns, which signals end-of-stream to the receiver.
+        let _ = self.tts.generate_with_config(
+            &text,
+            &generation_config(sid, speed),
+            Some(move |samples: &[f32], _progress: f32| {
+                let ok = forward_chunk(&tx, samples);
+                if !ok {
+                    alive_cb.store(false, Ordering::Relaxed);
+                }
+                ok
+            }),
+        );
+        alive.load(Ordering::Relaxed)
     }
 
     /// Synthesize sentences sequentially with streaming.
@@ -268,11 +283,11 @@ impl TtsEngine {
         text: &str,
         sid: i32,
         speed: f32,
-        tx: std::sync::mpsc::Sender<Vec<f32>>,
+        tx: Sender<Vec<f32>>,
     ) -> Result<u32> {
         let sentences = split_sentences(text);
 
-        if sentences.is_empty() || sentences.len() == 1 {
+        if sentences.len() <= 1 {
             // Fast path: single sentence or empty
             return self.synthesize_streaming(text, sid, speed, tx);
         }
@@ -283,38 +298,20 @@ impl TtsEngine {
             "Multi-sentence streaming synthesis"
         );
 
-        // Stream sentences sequentially
+        // 150 ms of silence between sentences (natural prosody)
+        let silence_samples = (self.sample_rate as f32 * 0.15) as usize;
+
         for (i, sentence) in sentences.iter().enumerate() {
-            let is_first = i == 0;
-            let c_text = cstring(sentence);
-
-            unsafe {
-                let arg = &tx as *const std::sync::mpsc::Sender<Vec<f32>> as *mut std::ffi::c_void;
-
-                if is_first {
-                    tracing::debug!("Streaming first sentence immediately");
-                }
-
-                let audio_ptr = sherpa_rs_sys::SherpaOnnxOfflineTtsGenerateWithCallbackWithArg(
-                    self.tts,
-                    c_text.as_ptr(),
-                    sid,
-                    speed,
-                    Some(streaming_callback),
-                    arg,
-                );
-
-                if !audio_ptr.is_null() {
-                    sherpa_rs_sys::SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio_ptr);
-                }
+            if i == 0 {
+                tracing::debug!("Streaming first sentence immediately");
             }
 
-            // Small pause between sentences (natural prosody)
-            // 150ms of silence at current sample rate
-            if i < sentences.len() - 1 {
-                let silence_samples = (self.sample_rate as f32 * 0.15) as usize;
-                let silence = vec![0.0f32; silence_samples];
-                let _ = tx.send(silence);
+            if !self.stream_one(sentence, sid, speed, tx.clone()) {
+                break; // receiver dropped — skip remaining sentences
+            }
+
+            if i < sentences.len() - 1 && tx.send(vec![0.0f32; silence_samples]).is_err() {
+                break;
             }
         }
 
@@ -322,66 +319,6 @@ impl TtsEngine {
         Ok(self.sample_rate)
     }
 }
-
-/// Warm up the streaming path with a dummy callback.
-unsafe fn streaming_warmup(
-    tts: *const sherpa_rs_sys::SherpaOnnxOfflineTts,
-    sid: i32,
-    speed: f32,
-    _tx: &std::sync::mpsc::Sender<Vec<f32>>,
-) {
-    let warmup_text = cstring("hi");
-    let arg = _tx as *const std::sync::mpsc::Sender<Vec<f32>> as *mut std::ffi::c_void;
-
-    let audio_ptr = unsafe {
-        sherpa_rs_sys::SherpaOnnxOfflineTtsGenerateWithCallbackWithArg(
-            tts,
-            warmup_text.as_ptr(),
-            sid,
-            speed,
-            Some(streaming_callback),
-            arg,
-        )
-    };
-
-    if !audio_ptr.is_null() {
-        unsafe {
-            sherpa_rs_sys::SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio_ptr);
-        }
-    }
-}
-
-/// C callback for streaming TTS. Copies samples and sends them through the channel.
-/// sherpa-onnx convention: return 1 to continue synthesis, 0 to stop.
-unsafe extern "C" fn streaming_callback(
-    samples: *const f32,
-    n: i32,
-    arg: *mut std::ffi::c_void,
-) -> i32 {
-    if samples.is_null() || n <= 0 {
-        return 1; // continue, just skip empty chunk
-    }
-    unsafe {
-        let tx = &*(arg as *const std::sync::mpsc::Sender<Vec<f32>>);
-        let chunk = std::slice::from_raw_parts(samples, n as usize).to_vec();
-        if tx.send(chunk).is_ok() {
-            1 // continue synthesis
-        } else {
-            0 // receiver dropped, stop synthesis
-        }
-    }
-}
-
-impl Drop for TtsEngine {
-    fn drop(&mut self) {
-        unsafe {
-            sherpa_rs_sys::SherpaOnnxDestroyOfflineTts(self.tts);
-        }
-    }
-}
-
-// TtsEngine wraps a raw pointer but the C library is thread-safe for single-writer access
-unsafe impl Send for TtsEngine {}
 
 pub fn resolve_voice_id(name: &str) -> i32 {
     VOICE_MAP
@@ -527,46 +464,40 @@ mod tests {
     }
 
     #[test]
-    fn streaming_callback_sends_chunks() {
+    fn forward_chunk_sends_chunks() {
         let (tx, rx) = std::sync::mpsc::channel();
         let samples: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4];
-        let arg = &tx as *const _ as *mut std::ffi::c_void;
-
-        let ret = unsafe { streaming_callback(samples.as_ptr(), 4, arg) };
-        assert_eq!(ret, 1);
-
+        assert!(forward_chunk(&tx, &samples));
         let received: Vec<f32> = rx.recv().unwrap();
         assert_eq!(received, samples);
     }
 
     #[test]
-    fn streaming_callback_stops_when_receiver_dropped() {
+    fn forward_chunk_stops_when_receiver_dropped() {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
-        drop(rx); // Drop receiver immediately
-
-        let samples: Vec<f32> = vec![0.1];
-        let arg = &tx as *const _ as *mut std::ffi::c_void;
-
-        let ret = unsafe { streaming_callback(samples.as_ptr(), 1, arg) };
-        assert_eq!(ret, 0); // should signal stop
+        drop(rx);
+        assert!(!forward_chunk(&tx, &[0.1])); // should signal stop
     }
 
     #[test]
-    fn streaming_callback_handles_null_samples() {
-        let (tx, _rx) = std::sync::mpsc::channel::<Vec<f32>>();
-        let arg = &tx as *const _ as *mut std::ffi::c_void;
-
-        let ret = unsafe { streaming_callback(std::ptr::null(), 10, arg) };
-        assert_eq!(ret, 1); // continue, just skip
+    fn forward_chunk_skips_empty() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        assert!(forward_chunk(&tx, &[])); // continue, just skip
+        drop(tx);
+        assert!(rx.recv().is_err(), "empty chunk must not be forwarded");
     }
 
     #[test]
-    fn streaming_callback_handles_zero_length() {
-        let (tx, _rx) = std::sync::mpsc::channel::<Vec<f32>>();
-        let samples: Vec<f32> = vec![0.1];
-        let arg = &tx as *const _ as *mut std::ffi::c_void;
+    fn sanitize_text_strips_nul() {
+        assert_eq!(sanitize_text("a\0b"), "a b");
+        assert!(matches!(sanitize_text("plain"), Cow::Borrowed("plain")));
+    }
 
-        let ret = unsafe { streaming_callback(samples.as_ptr(), 0, arg) };
-        assert_eq!(ret, 1); // continue, just skip
+    #[test]
+    fn generation_config_keeps_silence() {
+        let g = generation_config(3, 1.25);
+        assert_eq!(g.sid, 3);
+        assert!((g.speed - 1.25).abs() < f32::EPSILON);
+        assert!((g.silence_scale - 1.0).abs() < f32::EPSILON);
     }
 }

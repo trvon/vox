@@ -78,7 +78,10 @@ fn play_audio_blocking(samples: &[f32], sample_rate: u32) -> Result<()> {
         .ok_or_else(|| VoiceError::Audio("No output device available".to_string()))?;
 
     tracing::debug!(
-        device = device.name().unwrap_or_default(),
+        device = device
+            .description()
+            .map(|d| d.name().to_string())
+            .unwrap_or_default(),
         sample_rate,
         num_samples = samples.len(),
         "Playing audio"
@@ -86,7 +89,7 @@ fn play_audio_blocking(samples: &[f32], sample_rate: u32) -> Result<()> {
 
     let config = cpal::StreamConfig {
         channels: 1,
-        sample_rate: cpal::SampleRate(sample_rate),
+        sample_rate,
         buffer_size: cpal::BufferSize::Default,
     };
 
@@ -100,7 +103,7 @@ fn play_audio_blocking(samples: &[f32], sample_rate: u32) -> Result<()> {
 
     let stream = device
         .build_output_stream(
-            &config,
+            config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let current_pos = position_clone.load(Ordering::Relaxed);
                 let remaining = samples_clone.len().saturating_sub(current_pos);
@@ -165,14 +168,17 @@ fn play_audio_streaming_blocking(
         .ok_or_else(|| VoiceError::Audio("No output device available".to_string()))?;
 
     tracing::debug!(
-        device = device.name().unwrap_or_default(),
+        device = device
+            .description()
+            .map(|d| d.name().to_string())
+            .unwrap_or_default(),
         sample_rate,
         "Starting streaming playback"
     );
 
     let config = cpal::StreamConfig {
         channels: 1,
-        sample_rate: cpal::SampleRate(sample_rate),
+        sample_rate,
         buffer_size: cpal::BufferSize::Default,
     };
 
@@ -190,7 +196,7 @@ fn play_audio_streaming_blocking(
 
     let stream = device
         .build_output_stream(
-            &config,
+            config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let mut buf = ring_cpal.lock().unwrap();
                 for sample in data.iter_mut() {
@@ -254,6 +260,21 @@ pub fn peak_normalize(samples: &mut [f32], threshold: f32) -> f32 {
     peak
 }
 
+/// Scale toward `target_peak`, but never by more than `max_gain` and never
+/// attenuating. Unlike [`peak_normalize`], a near-silent segment of room noise
+/// can't be boosted 100x. Returns the gain applied.
+pub fn normalize_bounded(samples: &mut [f32], target_peak: f32, max_gain: f32) -> f32 {
+    let peak = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    if peak <= 0.0 || !peak.is_finite() {
+        return 1.0;
+    }
+    let gain = (target_peak / peak).clamp(1.0, max_gain.max(1.0));
+    if gain > 1.0 {
+        samples.iter_mut().for_each(|s| *s *= gain);
+    }
+    gain
+}
+
 /// Apply a second-order Butterworth high-pass filter in-place.
 pub fn apply_highpass_filter(samples: &mut [f32], cutoff_hz: f64, sample_rate: f64) {
     let mut hpf = BiquadHPF::highpass(cutoff_hz, sample_rate);
@@ -271,13 +292,49 @@ pub fn apply_noise_gate(window: &mut [f32], threshold: f32) {
 }
 
 /// Captured audio chunk from the microphone
+#[derive(Debug)]
 pub struct AudioChunk {
+    /// Absolute position of the first sample at the capture sample rate (16 kHz).
+    pub start_sample: u64,
     pub samples: Vec<f32>,
 }
+
+/// Process-wide admission control, shared by every microphone consumer.
+/// The permit is released only after the capture thread has stopped.
+#[derive(Default)]
+struct CaptureCoordinator(Arc<AtomicBool>);
+
+impl CaptureCoordinator {
+    fn acquire(&self) -> Result<CapturePermit> {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                VoiceError::Audio(
+                    "Microphone is busy; stop the active listener, recording, or calibration first"
+                        .into(),
+                )
+            })?;
+        Ok(CapturePermit(self.0.clone()))
+    }
+}
+
+struct CapturePermit(Arc<AtomicBool>);
+
+impl Drop for CapturePermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+static CAPTURE_COORDINATOR: std::sync::LazyLock<CaptureCoordinator> =
+    std::sync::LazyLock::new(CaptureCoordinator::default);
 
 /// Handle to stop audio capture. This is Send-safe.
 pub struct CaptureHandle {
     stop: Arc<AtomicBool>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+    captured: Arc<std::sync::atomic::AtomicU64>,
+    permit: Option<CapturePermit>,
     // The thread that owns the cpal::Stream (which is not Send)
     _thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -290,14 +347,27 @@ impl CaptureHandle {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+
+    /// Windows dropped because the consumer fell behind (channel full).
+    pub fn dropped_windows(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Stop and join capture, returning the exact end of all attempted windows,
+    /// including any dropped tail windows. Queued chunks can still be drained.
+    pub fn finish(&mut self) -> u64 {
+        self.stop();
+        if let Some(thread) = self._thread.take() {
+            let _ = thread.join();
+        }
+        self.permit.take();
+        self.captured.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for CaptureHandle {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self._thread.take() {
-            let _ = thread.join();
-        }
+        self.finish();
     }
 }
 
@@ -313,6 +383,25 @@ pub fn start_capture(
     noise_gate_rms: f32,
     window_size: usize,
 ) -> Result<(mpsc::Receiver<AudioChunk>, CaptureHandle)> {
+    start_capture_with(hpf_cutoff_hz, noise_gate_rms, window_size, 64)
+}
+
+/// Like [`start_capture`] with an explicit channel capacity (in windows).
+/// Long recordings use a large capacity so a slow consumer doesn't lose audio;
+/// any drops that still happen are counted in [`CaptureHandle::dropped_windows`].
+/// A `noise_gate_rms` of 0 disables the gate (use for archival capture).
+pub fn start_capture_with(
+    hpf_cutoff_hz: f64,
+    noise_gate_rms: f32,
+    window_size: usize,
+    channel_capacity: usize,
+) -> Result<(mpsc::Receiver<AudioChunk>, CaptureHandle)> {
+    if window_size == 0 {
+        return Err(VoiceError::Audio(
+            "capture window_size must be positive".into(),
+        ));
+    }
+    let permit = CAPTURE_COORDINATOR.acquire()?;
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -322,19 +411,27 @@ pub fn start_capture(
         .default_input_config()
         .map_err(|e| VoiceError::Audio(format!("Failed to get input config: {e}")))?;
 
-    let device_sample_rate = supported_config.sample_rate().0;
+    let device_sample_rate = supported_config.sample_rate();
     let device_channels = supported_config.channels() as usize;
 
     tracing::debug!(
-        device = device.name().unwrap_or_default(),
+        device = device
+            .description()
+            .map(|d| d.name().to_string())
+            .unwrap_or_default(),
         sample_rate = device_sample_rate,
         channels = device_channels,
         "Starting audio capture"
     );
 
-    let (tx, rx) = mpsc::channel::<AudioChunk>(64);
+    let (tx, rx) = mpsc::channel::<AudioChunk>(channel_capacity.max(1));
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
+    let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dropped_cb = dropped.clone();
+    let captured = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let captured_cb = captured.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
     // Spawn a dedicated thread that owns the cpal::Stream (which is not Send).
     // This thread runs until the stop flag is set.
@@ -346,12 +443,15 @@ pub fn start_capture(
         };
 
         let stop_inner = stop_clone.clone();
+        let stop_on_error = stop_clone.clone();
         let mut accumulator: Vec<f32> = Vec::with_capacity(window_size * 4);
         let mut window_buf = vec![0.0f32; window_size];
         let mut hpf = BiquadHPF::highpass(hpf_cutoff_hz, device_sample_rate as f64);
+        let mut resampler = StreamingResampler::new(device_sample_rate, TARGET_SAMPLE_RATE);
+        let mut next_sample = 0u64;
 
         let stream = match device.build_input_stream(
-            &config,
+            config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 if stop_inner.load(Ordering::Relaxed) {
                     return;
@@ -370,14 +470,9 @@ pub fn start_capture(
                 let filtered: Vec<f32> =
                     mono.iter().map(|&s| hpf.process(s as f64) as f32).collect();
 
-                // Resample to 16kHz if needed
-                let resampled = if device_sample_rate != TARGET_SAMPLE_RATE {
-                    resample(&filtered, device_sample_rate, TARGET_SAMPLE_RATE)
-                } else {
-                    filtered
-                };
-
-                accumulator.extend_from_slice(&resampled);
+                // Resample to 16kHz. The resampler is stateful so callback
+                // boundaries don't create discontinuities or drop fractional samples.
+                resampler.process(&filtered, &mut accumulator);
 
                 // Send complete VAD windows using pre-allocated buffer
                 while accumulator.len() >= window_size {
@@ -386,30 +481,39 @@ pub fn start_capture(
 
                     // RMS noise gate: zero out windows below threshold to prevent
                     // quiet echo/noise from triggering false VAD detections
-                    apply_noise_gate(&mut window_buf, noise_gate_rms);
+                    if noise_gate_rms > 0.0 {
+                        apply_noise_gate(&mut window_buf, noise_gate_rms);
+                    }
 
                     let chunk = AudioChunk {
+                        start_sample: next_sample,
                         samples: window_buf.clone(),
                     };
-                    let _ = tx.try_send(chunk);
+                    next_sample += window_size as u64;
+                    captured_cb.store(next_sample, Ordering::Release);
+                    if tx.try_send(chunk).is_err() {
+                        dropped_cb.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             },
             move |err| {
                 tracing::error!("Audio input error: {err}");
+                stop_on_error.store(true, Ordering::Release);
             },
             None,
         ) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("Failed to build input stream: {e}");
+                let _ = ready_tx.send(Err(format!("Failed to build input stream: {e}")));
                 return;
             }
         };
 
         if let Err(e) = stream.play() {
-            tracing::error!("Failed to start capture: {e}");
+            let _ = ready_tx.send(Err(format!("Failed to start capture: {e}")));
             return;
         }
+        let _ = ready_tx.send(Ok(()));
 
         // Keep the stream alive until stop is signaled
         while !stop_clone.load(Ordering::Relaxed) {
@@ -419,8 +523,23 @@ pub fn start_capture(
         drop(stream);
     });
 
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        result => {
+            stop.store(true, Ordering::Relaxed);
+            let _ = thread.join();
+            let message = match result {
+                Ok(Err(e)) => e,
+                _ => "Capture thread exited during startup".into(),
+            };
+            return Err(VoiceError::Audio(message));
+        }
+    }
     let handle = CaptureHandle {
         stop,
+        dropped,
+        captured,
+        permit: Some(permit),
         _thread: Some(thread),
     };
 
@@ -432,47 +551,154 @@ pub fn init() {
     let _ = &*KERNEL_TABLE;
 }
 
-/// Lanczos-3 windowed sinc resampler with precomputed kernel table.
+/// One-shot Lanczos-3 resample of a complete buffer.
 ///
-/// Uses a 6-tap (a=3) Lanczos kernel which suppresses aliasing far better than
-/// linear interpolation, especially for the common 48kHz→16kHz (3:1) downsampling
-/// of microphone input fed to the STT engine. The kernel is precomputed into a
-/// 512-entry lookup table to avoid sin() calls in the real-time audio path.
+/// Equivalent to feeding `samples` through a fresh [`StreamingResampler`] and
+/// flushing it. Produces `ceil(len * to / from)` samples.
 pub fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if from_rate == to_rate {
-        return samples.to_vec();
+    let mut rs = StreamingResampler::new(from_rate, to_rate);
+    let mut out = Vec::with_capacity(rs.expected_len(samples.len()) + 1);
+    rs.process(samples, &mut out);
+    rs.flush(&mut out);
+    out
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// Stateful Lanczos-3 windowed-sinc resampler for streaming audio.
+///
+/// - **Anti-aliased**: when downsampling, the kernel is stretched by
+///   `from/to` so its cutoff sits at the *target* Nyquist (8 kHz for 16 kHz
+///   output) instead of the source Nyquist. Without this, 8–24 kHz energy
+///   from a 48 kHz mic folds back into the speech band.
+/// - **Chunk-invariant**: output positions are tracked with exact integer
+///   arithmetic (`k * from / to`) over absolute sample indices, and input is
+///   buffered until every tap is available. Feeding audio in any chunking
+///   yields bit-identical output to feeding it all at once, with no drift over
+///   hours of capture.
+/// - **Unity DC gain**: weights are normalized per output sample.
+pub struct StreamingResampler {
+    from: u64,
+    to: u64,
+    scale: f64,
+    half_width: i64,
+    buf: Vec<f32>,
+    /// Absolute source index of `buf[0]`.
+    base: u64,
+    /// Absolute index of the next output sample.
+    next_out: u64,
+}
+
+impl StreamingResampler {
+    pub fn new(from_rate: u32, to_rate: u32) -> Self {
+        assert!(
+            from_rate > 0 && to_rate > 0,
+            "sample rates must be non-zero"
+        );
+        let g = gcd(from_rate as u64, to_rate as u64);
+        let (from, to) = (from_rate as u64 / g, to_rate as u64 / g);
+        let scale = (to as f64 / from as f64).min(1.0);
+        let half_width = (3.0 / scale).ceil() as i64;
+        Self {
+            from,
+            to,
+            scale,
+            half_width,
+            buf: Vec::new(),
+            base: 0,
+            next_out: 0,
+        }
     }
 
-    const A: i32 = 3; // Lanczos kernel half-width
+    /// Number of output samples a complete (flushed) input of `n` samples yields.
+    pub fn expected_len(&self, n: usize) -> usize {
+        (n as u64 * self.to).div_ceil(self.from) as usize
+    }
 
-    let ratio = from_rate as f64 / to_rate as f64;
-    let output_len = (samples.len() as f64 / ratio) as usize;
-    let mut output = Vec::with_capacity(output_len);
+    fn is_passthrough(&self) -> bool {
+        self.from == self.to
+    }
 
-    for i in 0..output_len {
-        let src_pos = i as f64 * ratio;
-        let center = src_pos.floor() as i32;
+    #[inline]
+    fn position(&self, k: u64) -> (u64, f64) {
+        let num = k * self.from;
+        (num / self.to, (num % self.to) as f64 / self.to as f64)
+    }
+
+    /// One output sample. Taps outside the available input (stream start, or
+    /// the right edge during `flush`) reuse the nearest edge sample rather than
+    /// truncating the kernel: renormalizing a truncated kernel amplifies
+    /// ringing (up to ~2.8x at the last sample), while edge extension keeps
+    /// DC exact and overshoot at interior levels.
+    #[inline]
+    fn compute(&self, ip: u64, frac: f64, end: u64) -> f32 {
+        let lo = ip as i64 - self.half_width + 1;
+        let hi = ip as i64 + self.half_width;
+        let first = self.base as i64;
+        let last = end as i64 - 1;
         let mut sum = 0.0_f64;
         let mut weight_sum = 0.0_f64;
-
-        for j in (center - A + 1)..=(center + A) {
-            let x = src_pos - j as f64;
-            let w = lanczos3_table(x);
-            if j >= 0 && (j as usize) < samples.len() {
-                sum += samples[j as usize] as f64 * w;
-                weight_sum += w;
-            }
+        for j in lo..=hi {
+            let x = (ip as i64 - j) as f64 + frac;
+            let w = lanczos3_table(x * self.scale);
+            let idx = j.clamp(first, last);
+            sum += self.buf[(idx - first) as usize] as f64 * w;
+            weight_sum += w;
         }
-
-        let sample = if weight_sum.abs() > 1e-10 {
-            sum / weight_sum
+        if weight_sum.abs() > 1e-10 {
+            (sum / weight_sum) as f32
         } else {
             0.0
-        };
-        output.push(sample as f32);
+        }
     }
 
-    output
+    /// Feed input and append every output sample whose taps are now available.
+    pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        if self.is_passthrough() {
+            out.extend_from_slice(input);
+            return;
+        }
+        self.buf.extend_from_slice(input);
+        let end = self.base + self.buf.len() as u64;
+        loop {
+            let (ip, frac) = self.position(self.next_out);
+            if ip as i64 + self.half_width >= end as i64 {
+                break;
+            }
+            out.push(self.compute(ip, frac, end));
+            self.next_out += 1;
+        }
+        // Drop input no future output can reach.
+        let (ip, _) = self.position(self.next_out);
+        let keep_from = (ip as i64 - self.half_width + 1).max(self.base as i64) as u64;
+        let drop = ((keep_from - self.base) as usize).min(self.buf.len());
+        self.buf.drain(..drop);
+        self.base += drop as u64;
+    }
+
+    /// Emit the remaining outputs (right edge uses only available samples).
+    /// The resampler should not be fed again after flushing.
+    pub fn flush(&mut self, out: &mut Vec<f32>) {
+        if self.is_passthrough() {
+            return;
+        }
+        let end = self.base + self.buf.len() as u64;
+        loop {
+            let (ip, frac) = self.position(self.next_out);
+            if ip >= end {
+                break;
+            }
+            out.push(self.compute(ip, frac, end));
+            self.next_out += 1;
+        }
+        self.buf.clear();
+        self.base = end;
+    }
 }
 
 // Precomputed Lanczos-3 kernel lookup table.
@@ -526,6 +752,36 @@ fn lanczos3_exact(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_permit_rejects_overlap_and_releases_on_drop() {
+        let coordinator = CaptureCoordinator::default();
+        let permit = coordinator.acquire().unwrap();
+        assert!(coordinator.acquire().is_err());
+        drop(permit);
+        assert!(coordinator.acquire().is_ok());
+    }
+
+    #[test]
+    fn capture_finish_joins_and_reports_tail_before_releasing_permit() {
+        let coordinator = CaptureCoordinator::default();
+        let permit = coordinator.acquire().unwrap();
+        let captured = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worker_captured = captured.clone();
+        let mut handle = CaptureHandle {
+            stop: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            captured,
+            permit: Some(permit),
+            _thread: Some(std::thread::spawn(move || {
+                worker_captured.store(1536, Ordering::Release);
+            })),
+        };
+        assert!(coordinator.acquire().is_err());
+        assert_eq!(handle.finish(), 1536);
+        assert_eq!(handle.finish(), 1536); // Idempotent.
+        assert!(coordinator.acquire().is_ok());
+    }
 
     #[test]
     fn resample_same_rate_is_passthrough() {

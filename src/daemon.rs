@@ -150,26 +150,23 @@ pub async fn start(tts: TtsEngine, stt: SttEngine, config: Config, port: u16) ->
     let _watcher = config::start_config_watcher(config.clone());
 
     let ct = tokio_util::sync::CancellationToken::new();
+    let runtime = crate::runtime::VoiceRuntime::with_shared(tts, stt, config.clone());
 
     let service = StreamableHttpService::new(
         {
-            let tts = tts.clone();
-            let stt = stt.clone();
-            let config = config.clone();
-            move || {
-                Ok(crate::server::VoiceMcpServer::with_shared(
-                    tts.clone(),
-                    stt.clone(),
-                    config.clone(),
-                ))
-            }
+            // One runtime for the whole process: sessions are per-connection (or
+            // per-request for stateless clients) but voice state must persist.
+            let runtime = runtime.clone();
+            move || Ok(crate::server::VoiceMcpServer::from_runtime(runtime.clone()))
         },
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig {
-            stateful_mode: true,
-            cancellation_token: ct.child_token(),
-            ..Default::default()
-        },
+        StreamableHttpServerConfig::default()
+            // Legacy (< 2026-07-28) clients still get sessions; newer clients are stateless.
+            .with_legacy_session_mode(true)
+            .with_cancellation_token(ct.child_token())
+            // The daemon controls the microphone: reject every browser Origin so a web
+            // page cannot drive it (DNS-rebinding / CSRF). Non-browser clients send no Origin.
+            .enforce_origin_validation(),
     );
 
     let router = axum::Router::new().nest_service("/mcp", service);
@@ -197,6 +194,9 @@ pub async fn start(tts: TtsEngine, stt: SttEngine, config: Config, port: u16) ->
             ct_shutdown.cancel();
         })
         .await?;
+
+    // Finalize any running recordings so their WAV/transcript/manifest are complete.
+    runtime.shutdown().await;
 
     remove_pid_file();
     Ok(())

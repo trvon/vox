@@ -11,7 +11,8 @@
     "vox-mcp": "run.js"
   },
   "scripts": {
-    "postinstall": "node install.js"
+    "postinstall": "node install.js",
+    "test": "node --test install.test.js"
   },
   "os": ["darwin", "linux"],
   "cpu": ["x64", "arm64"],

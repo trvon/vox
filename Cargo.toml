@@ -7,18 +7,21 @@ repository = "https://github.com/trvon/vox"
 license = "MIT"
 
 [dependencies]
-rmcp = { version = "0.14", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+rmcp = { version = "3.8", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 axum = "0.8"
 tokio-util = "0.7"
 tokio = { version = "1", features = ["full"] }
-cpal = "0.15"
-# On Linux, the sherpa-onnx "static" release archive does not ship linkable .a files,
-# which results in undefined SherpaOnnx* symbols at link time. Use shared libs.
-sherpa-rs = { version = "0.6", features = ["tts", "download-binaries"] }
-sherpa-rs-sys = { version = "0.6", features = ["download-binaries", "tts"] }
+cpal = "0.18"
+# Official k2-fsa bindings. Default feature `static` downloads the prebuilt static
+# archive for the target and links sherpa-onnx + onnxruntime into the binary
+# (no .so/.dylib to ship). Override with SHERPA_ONNX_LIB_DIR / SHERPA_ONNX_ARCHIVE_DIR.
+# Pinned to 1.13.x: 2.0 removed espeak-ng, so Kokoro silently drops every word
+# missing from the lexicon (numbers, names, "assistants", ...). Do not bump to 2.x
+# without an external G2P feeding `GenerationConfig::phoneme_codepoints`.
+sherpa-onnx = "=1.13.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 schemars = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
@@ -26,22 +29,31 @@ thiserror = "2"
 eyre = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 dirs = "6"
-indicatif = "0.17"
-console = "0.15"
+indicatif = "0.18"
+console = "0.16"
 hound = "3.5"
 tokio-stream = "0.1"
 futures = "0.3"
 tar = "0.4"
-bzip2 = "0.5"
-notify = "7"
+bzip2 = "0.6"
+notify = "8"
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Release speed with symbols, for perf/samply/flamegraph:
+#   cargo build --profile profiling   (see scripts/profile.sh)
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+lto = "thin"
+codegen-units = 16
 
 [profile.dev]
 debug = 0
@@ -52,7 +64,8 @@ debug = 0
 
 [dev-dependencies]
 tempfile = "3"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1"
 
 [[bench]]
 name = "tts_bench"
@@ -64,4 +77,8 @@ harness = false
 
 [[bench]]
 name = "dsp_quality_bench"
+harness = false
+
+[[bench]]
+name = "pipeline_bench"
 harness = false

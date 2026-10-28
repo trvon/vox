@@ -82,15 +82,109 @@ impl FromStr for KokoroModel {
     }
 }
 
+/// Speech-to-text model. Files live in `model_dir/<dir_name>`.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq, clap::ValueEnum, Default)]
+#[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
+pub enum SttModel {
+    /// Moonshine Base int8 (~60M params): fast, small, no token timestamps.
+    #[default]
+    MoonshineBase,
+    /// NVIDIA Parakeet TDT 0.6B v2 int8 (English): punctuated, token timestamps.
+    ParakeetTdtV2,
+    /// NVIDIA Parakeet TDT 0.6B v3 int8 (25 European languages).
+    ParakeetTdtV3,
+}
+
+impl SttModel {
+    pub const ALL: [SttModel; 3] = [
+        SttModel::MoonshineBase,
+        SttModel::ParakeetTdtV2,
+        SttModel::ParakeetTdtV3,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MoonshineBase => "moonshine-base",
+            Self::ParakeetTdtV2 => "parakeet-tdt-v2",
+            Self::ParakeetTdtV3 => "parakeet-tdt-v3",
+        }
+    }
+
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Self::MoonshineBase => "sherpa-onnx-moonshine-base-en-int8",
+            Self::ParakeetTdtV2 => "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
+            Self::ParakeetTdtV3 => "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+        }
+    }
+
+    pub fn archive_url(self) -> String {
+        format!(
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{}.tar.bz2",
+            self.dir_name()
+        )
+    }
+
+    /// Files that must exist for the model to load.
+    pub fn required_files(self) -> &'static [&'static str] {
+        match self {
+            Self::MoonshineBase => &[
+                "preprocess.onnx",
+                "encode.int8.onnx",
+                "uncached_decode.int8.onnx",
+                "cached_decode.int8.onnx",
+                "tokens.txt",
+            ],
+            Self::ParakeetTdtV2 | Self::ParakeetTdtV3 => &[
+                "encoder.int8.onnx",
+                "decoder.int8.onnx",
+                "joiner.int8.onnx",
+                "tokens.txt",
+            ],
+        }
+    }
+
+    /// Whether recognition results carry per-token timestamps.
+    pub fn has_timestamps(self) -> bool {
+        !matches!(self, Self::MoonshineBase)
+    }
+}
+
+impl std::fmt::Display for SttModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SttModel {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let s = s.trim().to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|m| m.as_str() == s)
+            .ok_or_else(|| {
+                let valid: Vec<_> = Self::ALL.iter().map(|m| m.as_str()).collect();
+                format!("Invalid stt_model: {s}. Valid values: {}", valid.join(", "))
+            })
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct Config {
     pub model_dir: PathBuf,
     pub kokoro_model: KokoroModel,
+    pub stt_model: SttModel,
     pub voice: String,
     pub speed: f32,
     pub log_level: String,
     pub tts_num_threads: Option<i32>,
+    /// Where long-form recordings and file transcriptions are stored.
+    /// Defaults to `$XDG_DATA_HOME/vox/recordings`.
+    pub recordings_dir: Option<PathBuf>,
     pub dsp: DspConfig,
 }
 
@@ -99,10 +193,12 @@ impl Default for Config {
         Self {
             model_dir: default_model_dir(),
             kokoro_model: KokoroModel::Int8V11,
+            stt_model: SttModel::default(),
             voice: "af_heart".to_string(),
             speed: 1.4,
             log_level: "info".to_string(),
             tts_num_threads: None,
+            recordings_dir: None,
             dsp: DspConfig::default(),
         }
     }
@@ -183,6 +279,15 @@ impl Config {
                 }
             }
         }
+        if let Ok(val) = std::env::var("VOX_STT_MODEL") {
+            match val.parse::<SttModel>() {
+                Ok(m) => config.stt_model = m,
+                Err(e) => tracing::warn!("{e}"),
+            }
+        }
+        if let Ok(val) = std::env::var("VOX_RECORDINGS_DIR") {
+            config.recordings_dir = Some(PathBuf::from(val));
+        }
         if let Ok(val) = std::env::var("VOX_VOICE") {
             config.voice = val;
         }
@@ -237,7 +342,9 @@ impl Config {
             "speed" => Some(self.speed.to_string()),
             "model_dir" => Some(self.model_dir.to_string_lossy().to_string()),
             "kokoro_model" => Some(self.kokoro_model.to_string()),
+            "stt_model" => Some(self.stt_model.to_string()),
             "log_level" => Some(self.log_level.clone()),
+            "recordings_dir" => Some(self.recordings_dir().to_string_lossy().to_string()),
             "dsp.hpf_cutoff_hz" => Some(self.dsp.hpf_cutoff_hz.to_string()),
             "dsp.noise_gate_rms" => Some(self.dsp.noise_gate_rms.to_string()),
             "dsp.noise_gate_window" => Some(self.dsp.noise_gate_window.to_string()),
@@ -272,11 +379,15 @@ impl Config {
                     .map_err(|_| format!("Invalid speed: {value}"))?;
                 table.insert(key.to_string(), toml::Value::Float(v as f64));
             }
-            "model_dir" => {
+            "model_dir" | "recordings_dir" => {
                 table.insert(key.to_string(), toml::Value::String(value.to_string()));
             }
             "kokoro_model" => {
                 let model = value.parse::<KokoroModel>()?;
+                table.insert(key.to_string(), toml::Value::String(model.to_string()));
+            }
+            "stt_model" => {
+                let model = value.parse::<SttModel>()?;
                 table.insert(key.to_string(), toml::Value::String(model.to_string()));
             }
             "log_level" => {
@@ -325,7 +436,7 @@ impl Config {
             }
             _ => {
                 return Err(format!(
-                    "Unknown config key: {key}\nValid keys: voice, speed, model_dir, kokoro_model, log_level, dsp.hpf_cutoff_hz, dsp.noise_gate_rms, dsp.noise_gate_window, dsp.normalize_threshold"
+                    "Unknown config key: {key}\nValid keys: voice, speed, model_dir, recordings_dir, kokoro_model, stt_model, log_level, dsp.hpf_cutoff_hz, dsp.noise_gate_rms, dsp.noise_gate_window, dsp.normalize_threshold"
                 ));
             }
         }
@@ -363,11 +474,13 @@ impl Config {
     /// Display all config values
     pub fn display_all(&self) -> String {
         format!(
-            "voice = \"{}\"\nspeed = {}\nmodel_dir = \"{}\"\nkokoro_model = \"{}\"\nlog_level = \"{}\"\n\n[dsp]\nhpf_cutoff_hz = {}\nnoise_gate_rms = {}\nnoise_gate_window = {}\nnormalize_threshold = {}",
+            "voice = \"{}\"\nspeed = {}\nmodel_dir = \"{}\"\nrecordings_dir = \"{}\"\nkokoro_model = \"{}\"\nstt_model = \"{}\"\nlog_level = \"{}\"\n\n[dsp]\nhpf_cutoff_hz = {}\nnoise_gate_rms = {}\nnoise_gate_window = {}\nnormalize_threshold = {}",
             self.voice,
             self.speed,
             self.model_dir.display(),
+            self.recordings_dir().display(),
             self.kokoro_model,
+            self.stt_model,
             self.log_level,
             self.dsp.hpf_cutoff_hz,
             self.dsp.noise_gate_rms,
@@ -378,12 +491,29 @@ impl Config {
 
     /// Resolve path for the Moonshine model directory
     pub fn moonshine_dir(&self) -> PathBuf {
-        self.model_dir.join("sherpa-onnx-moonshine-base-en-int8")
+        self.model_dir.join(SttModel::MoonshineBase.dir_name())
+    }
+
+    /// Resolve path for the configured STT model directory
+    pub fn stt_dir(&self) -> PathBuf {
+        self.model_dir.join(self.stt_model.dir_name())
     }
 
     /// Resolve path for the kokoro model directory
     pub fn kokoro_dir(&self) -> PathBuf {
         self.model_dir.join(self.kokoro_model.model_dir_name())
+    }
+
+    /// Resolve the recordings directory (config/env override or data dir default).
+    pub fn recordings_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.recordings_dir {
+            return dir.clone();
+        }
+        // Sibling of the default models dir: $XDG_DATA_HOME/vox/recordings
+        default_model_dir()
+            .parent()
+            .map(|p| p.join("recordings"))
+            .unwrap_or_else(|| PathBuf::from("recordings"))
     }
 
     /// Resolve path for the VAD model
@@ -460,6 +590,23 @@ pub fn start_config_watcher(shared: SharedConfig) -> Option<notify::RecommendedW
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stt_model_roundtrips() {
+        for m in SttModel::ALL {
+            assert_eq!(m.as_str().parse::<SttModel>().unwrap(), m);
+            let toml = format!("stt_model = \"{m}\"");
+            let c: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(c.stt_model, m);
+            assert!(
+                m.archive_url()
+                    .ends_with(&format!("{}.tar.bz2", m.dir_name()))
+            );
+            assert!(m.required_files().contains(&"tokens.txt"));
+        }
+        assert!("nope".parse::<SttModel>().is_err());
+        assert_eq!(Config::default().stt_model, SttModel::MoonshineBase);
+    }
 
     #[test]
     fn default_config_values() {

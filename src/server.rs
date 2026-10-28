@@ -1,20 +1,20 @@
 use crate::config::SharedConfig;
+use crate::recording::ExportFormat;
 use crate::runtime::{InboxMessage, VoiceRuntime, chrono_now};
 use crate::stt::SttEngine;
+use crate::transcript::LayoutOptions;
 use crate::tts::TtsEngine;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
-use rmcp::task_manager::OperationProcessor;
-use rmcp::{ErrorData as McpError, ServerHandler, task_handler, tool, tool_handler, tool_router};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig};
+use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use tokio::sync::Mutex as TokioMutex;
 
 /// MCP tool parameters for the `converse` tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -130,6 +130,123 @@ pub struct CalibrateParams {
     pub silence_secs: Option<u32>,
 }
 
+/// MCP tool parameters for `start_recording`
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct StartRecordingParams {
+    #[schemars(description = "Title for the recording (used in exports)")]
+    pub title: Option<String>,
+
+    #[schemars(description = "Save the raw 16 kHz audio as audio.wav (default: true)")]
+    #[serde(default = "default_true")]
+    pub save_audio: bool,
+}
+
+/// MCP tool parameters for `stop_recording`
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct StopRecordingParams {
+    #[schemars(description = "Recording or file-job id (default: the active live recording)")]
+    pub recording_id: Option<String>,
+
+    #[schemars(
+        description = "Skip transcription of not-yet-transcribed audio (audio is still kept). Default false: finalize everything."
+    )]
+    #[serde(default)]
+    pub cancel: bool,
+
+    #[schemars(description = "Wait until finalization completes before returning (default: true)")]
+    #[serde(default = "default_true")]
+    pub wait: bool,
+}
+
+/// MCP tool parameters for `recording_status`
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct RecordingStatusParams {
+    #[schemars(description = "Recording or file-job id (default: the active live recording)")]
+    pub recording_id: Option<String>,
+}
+
+/// MCP tool parameters for `mark_recording`
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct MarkRecordingParams {
+    #[schemars(
+        description = "Section label, e.g. 'Q&A' or 'Part 2: Results'. Starts a new section in exports."
+    )]
+    pub label: String,
+
+    #[schemars(description = "Recording id (default: the active live recording)")]
+    pub recording_id: Option<String>,
+}
+
+/// MCP tool parameters for `list_recordings`
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ListRecordingsParams {
+    #[schemars(description = "Maximum number of recordings to return, newest first (default: 20)")]
+    pub limit: Option<usize>,
+}
+
+/// MCP tool parameters for `transcribe_file`
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct TranscribeFileParams {
+    #[schemars(
+        description = "Absolute path to an audio file on the server machine. WAV is read natively; other formats (mp3, m4a, flac, video) need ffmpeg."
+    )]
+    pub path: String,
+
+    #[schemars(description = "Title for the transcript (default: file name)")]
+    pub title: Option<String>,
+
+    #[schemars(
+        description = "Block until transcription finishes (default: false — returns a job id; poll recording_status)"
+    )]
+    #[serde(default)]
+    pub wait: bool,
+}
+
+/// MCP tool parameters for `get_transcript`
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GetTranscriptParams {
+    #[schemars(description = "Recording or file-job id")]
+    pub recording_id: String,
+
+    #[schemars(
+        description = "Return segments after this cursor (the next_cursor of the previous page). Omit to start at the beginning."
+    )]
+    pub cursor: Option<u64>,
+
+    #[schemars(description = "Maximum segments per page (default: 100, max 1000)")]
+    pub limit: Option<usize>,
+}
+
+/// MCP tool parameters for `export_transcript`
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ExportTranscriptParams {
+    #[schemars(description = "Recording or file-job id")]
+    pub recording_id: String,
+
+    #[schemars(
+        description = "markdown (sectioned, timestamped drafting scaffold for blog posts/notes), text, srt, vtt, or json. Default: markdown"
+    )]
+    #[serde(default = "default_export_format")]
+    pub format: ExportFormat,
+
+    #[schemars(description = "Pause (seconds) that starts a new paragraph (default: 2.0)")]
+    pub paragraph_gap_secs: Option<f32>,
+
+    #[schemars(
+        description = "Without markers, start a new section after this many minutes (default: 5)"
+    )]
+    pub section_minutes: Option<f32>,
+
+    #[schemars(
+        description = "Maximum characters returned inline (default: 40000). The full export is always written to the returned path."
+    )]
+    pub max_chars: Option<usize>,
+}
+
+fn default_export_format() -> ExportFormat {
+    ExportFormat::Markdown
+}
+
 static CONVERSE_COUNTER: AtomicU64 = AtomicU64::new(1);
 const CONVERSE_AUTO_ASYNC_THRESHOLD_CHARS: usize = 600;
 
@@ -152,7 +269,6 @@ fn default_converse_silence_timeout() -> u32 {
 #[derive(Clone)]
 pub struct VoiceMcpServer {
     runtime: VoiceRuntime,
-    processor: Arc<TokioMutex<OperationProcessor>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -168,9 +284,15 @@ impl VoiceMcpServer {
         stt: Arc<std::sync::Mutex<SttEngine>>,
         config: SharedConfig,
     ) -> Self {
+        Self::from_runtime(VoiceRuntime::with_shared(tts, stt, config))
+    }
+
+    /// Create a server around an existing runtime. The daemon shares one runtime
+    /// across all MCP sessions so background listening, the TTS queue, and
+    /// recordings survive reconnects (and stateless 2026-07-28 requests).
+    pub(crate) fn from_runtime(runtime: VoiceRuntime) -> Self {
         Self {
-            runtime: VoiceRuntime::with_shared(tts, stt, config),
-            processor: Arc::new(TokioMutex::new(OperationProcessor::new())),
+            runtime,
             tool_router: Self::tool_router(),
         }
     }
@@ -202,93 +324,45 @@ impl VoiceMcpServer {
         &self,
         Parameters(params): Parameters<ConverseParams>,
     ) -> Result<CallToolResult, McpError> {
+        let listen = params
+            .wait_for_response
+            .then_some((params.silence_timeout_ms, params.min_speech_ms));
         if Self::should_converse_async(&params) {
             let conversation_id = Self::new_conversation_id();
-            let conversation_id_for_ack = conversation_id.clone();
+            let id = conversation_id.clone();
             let runtime = self.runtime.clone();
-            let params = params;
-
             tokio::spawn(async move {
-                let speak_result = runtime
-                    .speak(&params.message, params.voice.as_deref(), Some(params.speed))
-                    .await;
-
-                if let Err(e) = speak_result {
-                    runtime.push_inbox(InboxMessage {
-                        text: format!("converse failed during speak: {e}"),
-                        timestamp: chrono_now(),
-                        source: Some("converse".to_string()),
-                        conversation_id: Some(conversation_id.clone()),
-                    });
-                    return;
-                }
-
-                if !params.wait_for_response {
-                    runtime.push_inbox(InboxMessage {
-                        text: "Message spoken successfully".to_string(),
-                        timestamp: chrono_now(),
-                        source: Some("converse".to_string()),
-                        conversation_id: Some(conversation_id.clone()),
-                    });
-                    return;
-                }
-
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                match runtime
-                    .record_and_transcribe(params.silence_timeout_ms, params.min_speech_ms)
+                let text = runtime
+                    .converse(
+                        &params.message,
+                        params.voice.as_deref(),
+                        params.speed,
+                        listen,
+                    )
                     .await
-                {
-                    Ok(text) => {
-                        runtime.push_inbox(InboxMessage {
-                            text,
-                            timestamp: chrono_now(),
-                            source: Some("converse".to_string()),
-                            conversation_id: Some(conversation_id.clone()),
-                        });
-                    }
-                    Err(e) => {
-                        runtime.push_inbox(InboxMessage {
-                            text: format!("converse failed during listen/transcribe: {e}"),
-                            timestamp: chrono_now(),
-                            source: Some("converse".to_string()),
-                            conversation_id: Some(conversation_id.clone()),
-                        });
-                    }
-                }
+                    .unwrap_or_else(|e| format!("converse failed: {e}"));
+                runtime.push_inbox(InboxMessage {
+                    text,
+                    timestamp: chrono_now(),
+                    source: Some("converse".into()),
+                    conversation_id: Some(id),
+                });
             });
-
-            let ack = serde_json::json!({
-                "status": "accepted",
-                "conversation_id": conversation_id_for_ack,
-                "delivery": "check_inbox"
-            });
-            return Ok(CallToolResult::success(vec![Content::text(
-                ack.to_string(),
-            )]));
+            return json_result(&serde_json::json!({
+                "status": "accepted", "conversation_id": conversation_id, "delivery": "check_inbox",
+            }));
         }
-
-        self.runtime
-            .speak(&params.message, params.voice.as_deref(), Some(params.speed))
-            .await
-            .map_err(|e| McpError::internal_error(e, None))?;
-
-        if !params.wait_for_response {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "Message spoken successfully",
-            )]));
-        }
-
-        // Let macOS Core Audio drain output buffers and amplifier settle
-        // before opening the mic, preventing TTS echo from contaminating capture
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
         let text = self
             .runtime
-            .record_and_transcribe(params.silence_timeout_ms, params.min_speech_ms)
+            .converse(
+                &params.message,
+                params.voice.as_deref(),
+                params.speed,
+                listen,
+            )
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[tool(
@@ -309,32 +383,25 @@ impl VoiceMcpServer {
             "pending_count": pending_count
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             ack.to_string(),
         )]))
     }
 
     #[tool(
         name = "enqueue_say",
-        description = "Queue speech for ordered asynchronous playback. Returns a speech_id immediately."
+        description = "Compatibility alias for say: queue speech for ordered asynchronous playback and return a speech_id immediately."
     )]
     async fn enqueue_say(
         &self,
         Parameters(params): Parameters<EnqueueSayParams>,
     ) -> Result<CallToolResult, McpError> {
-        let (speech_id, pending_count) = self
-            .runtime
-            .enqueue_speech(params.message, params.voice, params.speed)
-            .await;
-        let ack = serde_json::json!({
-            "status": "queued",
-            "speech_id": speech_id,
-            "pending_count": pending_count
-        });
-
-        Ok(CallToolResult::success(vec![Content::text(
-            ack.to_string(),
-        )]))
+        self.say(Parameters(SayParams {
+            message: params.message,
+            voice: params.voice,
+            speed: params.speed,
+        }))
+        .await
     }
 
     #[tool(
@@ -348,7 +415,7 @@ impl VoiceMcpServer {
         let status = self.runtime.tts_queue_status_snapshot().await;
         let json = serde_json::to_string_pretty(&status)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -362,7 +429,7 @@ impl VoiceMcpServer {
         let result = self.runtime.clear_tts_queue().await;
         let json = serde_json::to_string_pretty(&result)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -379,7 +446,7 @@ impl VoiceMcpServer {
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[tool(
@@ -396,7 +463,7 @@ impl VoiceMcpServer {
             .await
             .map_err(|e| McpError::invalid_request(e, None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
 
     #[tool(
@@ -411,7 +478,7 @@ impl VoiceMcpServer {
 
         let json = serde_json::to_string_pretty(&messages).unwrap_or_else(|_| "[]".to_string());
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -430,7 +497,7 @@ impl VoiceMcpServer {
 
         let json = serde_json::to_string_pretty(&messages).unwrap_or_else(|_| "[]".to_string());
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -446,7 +513,7 @@ impl VoiceMcpServer {
             .reset_dsp()
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
 
     #[tool(
@@ -462,7 +529,176 @@ impl VoiceMcpServer {
             .reload_config()
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
+    }
+
+    #[tool(
+        name = "start_recording",
+        description = "Start a long-form recording (lecture, meeting, dictation) from the microphone. Runs in the background for hours: audio is saved to disk and transcribed incrementally with timestamps. Returns a recording_id. Use recording_status to monitor, mark_recording to add section markers, stop_recording to finish, then get_transcript / export_transcript. Run vox as a daemon so the recording survives client restarts."
+    )]
+    async fn start_recording(
+        &self,
+        Parameters(params): Parameters<StartRecordingParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let view = self
+            .runtime
+            .start_recording(params.title, params.save_audio)
+            .await
+            .map_err(|e| McpError::invalid_request(e, None))?;
+        json_result(&view)
+    }
+
+    #[tool(
+        name = "stop_recording",
+        description = "Stop a live recording (or a file transcription job) and finalize its transcript. Audio is never deleted. Returns the final status including paths."
+    )]
+    async fn stop_recording(
+        &self,
+        Parameters(params): Parameters<StopRecordingParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let view = self
+            .runtime
+            .recordings()
+            .stop(params.recording_id.as_deref(), params.cancel, params.wait)
+            .await
+            .map_err(|e| McpError::invalid_request(e, None))?;
+        json_result(&view)
+    }
+
+    #[tool(
+        name = "recording_status",
+        description = "Status of a recording or file-transcription job: state, captured/transcribed duration, lag, progress, segment count, dropped audio gaps, STT real-time factor, last transcribed text, and file paths."
+    )]
+    async fn recording_status(
+        &self,
+        Parameters(params): Parameters<RecordingStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let rec = self.runtime.recordings();
+        let id = match params.recording_id.or_else(|| rec.live_id()) {
+            Some(id) => id,
+            None => {
+                return json_result(&serde_json::json!({
+                    "active": false,
+                    "message": "No live recording. Pass recording_id, or see list_recordings.",
+                }));
+            }
+        };
+        let view = rec
+            .view(&id)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        json_result(&view)
+    }
+
+    #[tool(
+        name = "mark_recording",
+        description = "Insert a section marker at the current position of an active recording. Markers become section headings in export_transcript."
+    )]
+    async fn mark_recording(
+        &self,
+        Parameters(params): Parameters<MarkRecordingParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let marker = self
+            .runtime
+            .recordings()
+            .mark(params.recording_id.as_deref(), params.label)
+            .map_err(|e| McpError::invalid_request(e, None))?;
+        json_result(&marker)
+    }
+
+    #[tool(
+        name = "list_recordings",
+        description = "List recordings and file transcriptions, newest first, with status and paths."
+    )]
+    async fn list_recordings(
+        &self,
+        Parameters(params): Parameters<ListRecordingsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let list = self
+            .runtime
+            .recordings()
+            .list(params.limit.unwrap_or(20).clamp(1, 500));
+        json_result(&list)
+    }
+
+    #[tool(
+        name = "transcribe_file",
+        description = "Transcribe an existing audio/video file (e.g. a recorded lecture) with timestamps. Returns a recording_id immediately; poll recording_status for progress, then use get_transcript / export_transcript. Set wait=true for short files."
+    )]
+    async fn transcribe_file(
+        &self,
+        Parameters(params): Parameters<TranscribeFileParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let rec = self.runtime.recordings();
+        let (view, mut done) = self
+            .runtime
+            .transcribe_file(params.path.into(), params.title)
+            .await
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        if params.wait {
+            let _ = done.wait_for(|d| *d).await;
+            let view = rec
+                .view(&view.manifest.id)
+                .map_err(|e| McpError::internal_error(e, None))?;
+            return json_result(&view);
+        }
+        json_result(&view)
+    }
+
+    #[tool(
+        name = "get_transcript",
+        description = "Read transcript segments ({seq, start_ms, end_ms, text}) page by page. Works while a recording is still running: keep calling with next_cursor to tail new segments. complete=true means everything has been read."
+    )]
+    async fn get_transcript(
+        &self,
+        Parameters(params): Parameters<GetTranscriptParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let page = self
+            .runtime
+            .recordings()
+            .transcript_page(
+                &params.recording_id,
+                params.cursor,
+                params.limit.unwrap_or(100).clamp(1, 1000),
+            )
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        json_result(&page)
+    }
+
+    #[tool(
+        name = "export_transcript",
+        description = "Export a transcript. 'markdown' produces a blog/lecture-notes drafting scaffold: sections (from markers or time), paragraphs split at pauses, and [mm:ss] timestamps for every paragraph so quotes can be traced to the audio. Also: text, srt, vtt, json. Writes the file next to the recording and returns its path plus the content (truncated to max_chars)."
+    )]
+    async fn export_transcript(
+        &self,
+        Parameters(params): Parameters<ExportTranscriptParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut layout = LayoutOptions::default();
+        if let Some(g) = params
+            .paragraph_gap_secs
+            .filter(|g| g.is_finite() && *g >= 0.0)
+        {
+            layout.paragraph_gap_ms = (g * 1000.0) as u64;
+        }
+        if let Some(m) = params.section_minutes.filter(|m| m.is_finite() && *m > 0.0) {
+            layout.section_target_ms = (m * 60_000.0) as u64;
+        }
+        let (path, content) = self
+            .runtime
+            .recordings()
+            .export(&params.recording_id, params.format, &layout)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let max = params.max_chars.unwrap_or(40_000);
+        let total_chars = content.chars().count();
+        let truncated = total_chars > max;
+        let inline: String = content.chars().take(max).collect();
+        json_result(&serde_json::json!({
+            "recording_id": params.recording_id,
+            "format": params.format,
+            "path": path,
+            "total_chars": total_chars,
+            "truncated": truncated,
+            "content": inline,
+        }))
     }
 
     #[tool(
@@ -473,32 +709,16 @@ impl VoiceMcpServer {
         &self,
         Parameters(params): Parameters<CalibrateParams>,
     ) -> Result<CallToolResult, McpError> {
-        let config = self
-            .runtime
-            .config_snapshot()
-            .map_err(|e| McpError::internal_error(e, None))?;
-        let speech_secs = params.speech_secs.unwrap_or(10);
-        let silence_secs = params.silence_secs.unwrap_or(5);
         let dry_run = params.dry_run;
-
-        let result = crate::calibrate::run_calibration(
-            &config,
-            speech_secs,
-            silence_secs,
-            40, // population
-            30, // generations
-            dry_run,
-        )
-        .await
-        .map_err(|e| McpError::internal_error(format!("Calibration failed: {e}"), None))?;
-
-        // Auto-reload config so new DSP params take effect immediately
-        if !dry_run {
-            self.runtime
-                .reload_config()
-                .await
-                .map_err(|e| McpError::internal_error(e, None))?;
-        }
+        let result = self
+            .runtime
+            .calibrate(
+                params.speech_secs.unwrap_or(10),
+                params.silence_secs.unwrap_or(5),
+                dry_run,
+            )
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
 
         let status = if dry_run {
             "Results NOT saved (dry_run=true). Set dry_run=false to persist."
@@ -527,32 +747,32 @@ impl VoiceMcpServer {
             result.noise_floor_db,
             status,
         );
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
 }
 
-#[task_handler]
 #[tool_handler]
-#[allow(deprecated)] // task_handler macro uses deprecated type aliases in rmcp 0.14
 impl ServerHandler for VoiceMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: rmcp::model::ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder()
-                .enable_tools()
-                .enable_tasks()
-                .build(),
-            server_info: rmcp::model::Implementation::from_build_env(),
-            instructions: Some(
-                "Vox: voice MCP server with text-to-speech and speech-to-text. \
-                 Use 'say' or 'enqueue_say' to queue speech, 'tts_queue_status' to inspect queue state, \
-                 'tts_queue_clear' to clear pending speech, 'listen' to capture and transcribe speech, \
-                 or 'converse' for a speak-then-listen interaction."
-                    .to_string(),
-            ),
-        }
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(rmcp::model::Implementation::from_build_env())
+            .with_instructions(SERVER_INSTRUCTIONS)
     }
 }
+
+fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+}
+
+const SERVER_INSTRUCTIONS: &str = "Vox: local voice MCP server with text-to-speech and speech-to-text. \
+ Use 'say' to queue speech ('enqueue_say' is a compatibility alias), 'tts_queue_status' to inspect queue state, \
+ 'tts_queue_clear' to clear pending speech, 'listen' to capture and transcribe speech, \
+ or 'converse' for a speak-then-listen interaction. \
+ For lectures, meetings and long dictation use 'start_recording' / 'mark_recording' / 'stop_recording' \
+ (or 'transcribe_file' for existing audio), then 'get_transcript' to page through timestamped segments \
+ and 'export_transcript' (format=markdown) for a sectioned drafting scaffold to turn into a blog post or notes.";
 
 #[cfg(test)]
 mod tests {

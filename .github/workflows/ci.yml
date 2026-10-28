@@ -17,15 +17,31 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
           cache-on-failure: true
+
+      # sherpa-onnx-sys caches absolute native-library paths, while rust-cache
+      # may omit target/sherpa-onnx-prebuilt. Rerun discovery after restoration.
+      - name: Refresh sherpa native library discovery
+        run: |
+          # A restored lib/ directory may be empty: sherpa's build script only
+          # checks that it exists. Discard partial native caches before discovery.
+          python3 - <<'PY'
+          import shutil
+          from pathlib import Path
+          cache = Path("target/sherpa-onnx-prebuilt")
+          if cache.exists():
+              print(f"Restored native archives: {len(list(cache.rglob('*.a')))}")
+              shutil.rmtree(cache)
+          PY
+          cargo clean --package sherpa-onnx-sys
 
       - name: Install Linux deps
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libclang-dev
@@ -34,7 +50,17 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
-      - name: Check test compilation
-        run: cargo check --tests
+      # Model-free: unit tests, config integration, and proptest invariants.
+      - name: Test
+        run: cargo test
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Test npm installer
+        run: npm test --prefix npm
+      - name: Test source installer
+        run: python3 tests/setup_install.py
+      - name: Check setup script
+        run: bash -n setup.sh

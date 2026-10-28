@@ -1,0 +1,19 @@
+# Managed by vox service install. Customize with systemctl --user edit vox.service.
+[Unit]
+Description=Vox local voice MCP daemon
+After=pipewire.service pipewire-pulse.service pulseaudio.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=:@VOX_EXECUTABLE@ daemon start --foreground
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=300s
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
