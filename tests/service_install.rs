@@ -159,6 +159,12 @@ fn systemd_parser_accepts_literal_special_characters_in_binary_path() {
             .unwrap(),
     );
     let verify = Command::new("systemd-analyze")
+        // CI/headless shells have no login runtime directory. Verification
+        // creates its own offline manager; it must not depend on our session.
+        .env("HOME", sandbox.root.path())
+        .env("XDG_CONFIG_HOME", sandbox.root.path().join("config"))
+        .env("XDG_RUNTIME_DIR", sandbox.root.path().join("run"))
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
         .args(["--user", "verify"])
         .arg(sandbox.unit())
         .output()
