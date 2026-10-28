@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.0](https://github.com/trvon/vox/compare/v0.2.0...v0.3.0) (2026-10-28)
+
+
+### Features
+
+* **config:** add seamless Kokoro model selection with auto-download and hot swap ([94044e7](https://github.com/trvon/vox/commit/94044e73a2d9417c610d831d262092d14fb77418))
+* durable transcription workflows and user-service installation ([#8](https://github.com/trvon/vox/issues/8)) ([5da5c2b](https://github.com/trvon/vox/commit/5da5c2be3464b21104680014ec9a8a937d928e77))
+* quality of life improvements ([14ef7d5](https://github.com/trvon/vox/commit/14ef7d5b5e9b19886727823ffc38c06b8a1dc832))
+* **server:** add ordered TTS queue tools ([0593fa3](https://github.com/trvon/vox/commit/0593fa3623be54883a5f6fa7b7fe8ab97bd28a9d))
+* updating cargo.lock ([e616bfb](https://github.com/trvon/vox/commit/e616bfb2578b83c52afb58be56854c6d9745ba27))
+* **vox:** add daemon-backed tool CLI and extract shared voice runtime ([cd76993](https://github.com/trvon/vox/commit/cd7699399452796385d2992dacdd73f446d74366))
+
+
+### Bug Fixes
+
+* linux build fixes ([fcfe811](https://github.com/trvon/vox/commit/fcfe81111b73145fb82870bbe950840ce00a13b8))
+* **models:** stream archive extraction to avoid download OOM ([2894766](https://github.com/trvon/vox/commit/2894766db5cb4b1e30a351313dc1c1b200018f1c))
+
+
+### Performance Improvements
+
+* precompute bounded rational-phase resampling kernels ([#9](https://github.com/trvon/vox/issues/9)) ([bc66877](https://github.com/trvon/vox/commit/bc66877ef9ac86bbee625ce2fdbe9cd237cda0c3))
+
 ## [0.2.0](https://github.com/trvon/vox/compare/v0.1.0...v0.2.0) (2026-02-09)
 
 
