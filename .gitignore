@@ -4,3 +4,15 @@
 .DS_Store
 .act-secrets
 .act-env
+
+# Generated agent state (keep shared project configuration trackable)
+/.pi/loops/
+/.pi/tasks/
+/.pi/mcp-traces/
+/.claude/worktrees/
+
+# npm downloads and local dependencies
+/npm/bin/
+/npm/node_modules/
+/npm/.vox-install-*/
+/npm/vox-*.tar.gz
