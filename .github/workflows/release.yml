@@ -57,7 +57,18 @@ jobs:
 
       # Cached Rust build metadata may outlive the downloaded native assets.
       - name: Refresh sherpa native library discovery
-        run: cargo clean --package sherpa-onnx-sys
+        run: |
+          # A restored lib/ directory may be empty: sherpa's build script only
+          # checks that it exists. Discard partial native caches before discovery.
+          python3 - <<'PY'
+          import shutil
+          from pathlib import Path
+          cache = Path("target/sherpa-onnx-prebuilt")
+          if cache.exists():
+              print(f"Restored native archives: {len(list(cache.rglob('*.a')))}")
+              shutil.rmtree(cache)
+          PY
+          cargo clean --package sherpa-onnx-sys
 
       - name: Install cross-compilation tools (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
