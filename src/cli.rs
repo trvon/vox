@@ -76,7 +76,7 @@ pub enum Command {
         /// Number of GA generations
         #[arg(long, default_value = "30")]
         generations: usize,
-        /// Print results without saving to config
+        /// Preview without saving (calibration saves by default)
         #[arg(long)]
         dry_run: bool,
     },
@@ -253,12 +253,14 @@ pub enum ToolAction {
 pub enum ConfigAction {
     /// Show a config value (or all values if no key given)
     Get {
-        /// Config key (e.g. voice, speed, model_dir, kokoro_model, log_level)
+        /// Config key: voice, speed, model_dir, recordings_dir, kokoro_model,
+        /// stt_model, log_level, or a dsp.* key
         key: Option<String>,
     },
     /// Set a config value
     Set {
-        /// Config key (e.g. voice, speed, model_dir, kokoro_model, log_level)
+        /// Config key: voice, speed, model_dir, recordings_dir, kokoro_model,
+        /// stt_model, log_level, or a dsp.* key
         key: String,
         /// Value to set
         value: String,
