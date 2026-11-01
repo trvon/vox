@@ -225,6 +225,20 @@ pub fn stop_daemon() -> eyre::Result<()> {
     stop_daemon_at(&pid_file_path())
 }
 
+/// Stop the tracked daemon if there is one.
+///
+/// A missing PID file means nothing to stop, which is not an error for callers
+/// like `daemon restart`. A stop that times out *is* an error, so the caller can
+/// abort instead of starting a second daemon beside the surviving one.
+pub fn stop_daemon_if_running() -> eyre::Result<()> {
+    let path = pid_file_path();
+    if path.exists() {
+        stop_daemon_at(&path)
+    } else {
+        Ok(())
+    }
+}
+
 /// Stop the daemon described by `path`, which lets tests use a private PID file
 /// instead of mutating `XDG_RUNTIME_DIR` while other tests run in parallel.
 fn stop_daemon_at(path: &std::path::Path) -> eyre::Result<()> {
