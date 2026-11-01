@@ -136,7 +136,7 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
                         Some(val) => println!("{val}"),
                         None => {
                             eprintln!(
-                                "Unknown key: {key}\nValid derived keys: config_file, model_dir, recordings_dir, log_file, pid_file, port"
+                                "Unknown key: {key}\nValid config keys: voice, speed, model_dir, recordings_dir, kokoro_model, stt_model, log_level, dsp.hpf_cutoff_hz, dsp.noise_gate_rms, dsp.noise_gate_window, dsp.normalize_threshold\nValid derived keys: config_file, log_file, pid_file, port"
                             );
                             std::process::exit(1);
                         }
