@@ -371,6 +371,7 @@ impl Config {
         // Validate and insert
         match key {
             "voice" => {
+                crate::tts::resolve_voice_id(value).map_err(|e| e.to_string())?;
                 table.insert(key.to_string(), toml::Value::String(value.to_string()));
             }
             "speed" => {

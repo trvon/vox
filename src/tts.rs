@@ -161,7 +161,7 @@ impl TtsEngine {
 
         // Warm up with the actual voice/speed we'll use (batch + streaming path)
         // so the ONNX Runtime session is hot for the first real request.
-        let gen_config = generation_config(resolve_voice_id(&config.voice), config.speed);
+        let gen_config = generation_config(resolve_voice_id(&config.voice)?, config.speed);
         let _ = tts.generate_with_config::<NoCallback>("hi", &gen_config, None);
         let (tx, _rx) = std::sync::mpsc::channel::<Vec<f32>>();
         let _ = tts.generate_with_config(
@@ -205,7 +205,7 @@ impl TtsEngine {
     ) -> Result<TtsAudio> {
         let voice_name = voice.unwrap_or(&self.default_voice);
         let speed = speed.unwrap_or(self.default_speed);
-        let sid = resolve_voice_id(voice_name);
+        let sid = resolve_voice_id(voice_name)?;
 
         tracing::debug!(
             voice = voice_name,
@@ -320,15 +320,27 @@ impl TtsEngine {
     }
 }
 
-pub fn resolve_voice_id(name: &str) -> i32 {
-    VOICE_MAP
+pub fn resolve_voice_id(name: &str) -> Result<i32> {
+    if let Some((_, id)) = VOICE_MAP.iter().find(|(voice_name, _)| *voice_name == name) {
+        return Ok(*id);
+    }
+
+    let min_id = VOICE_MAP.iter().map(|(_, id)| *id).min().unwrap_or(0);
+    let max_id = VOICE_MAP.iter().map(|(_, id)| *id).max().unwrap_or(0);
+    if let Ok(id) = name.parse::<i32>()
+        && (min_id..=max_id).contains(&id)
+    {
+        return Ok(id);
+    }
+
+    let valid_names = VOICE_MAP
         .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, id)| *id)
-        .unwrap_or_else(|| {
-            // Try parsing as numeric ID
-            name.parse::<i32>().unwrap_or(0)
-        })
+        .map(|(voice_name, _)| *voice_name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(VoiceError::Config(format!(
+        "invalid voice '{name}': expected a known name ({valid_names}) or speaker id {min_id}..={max_id}"
+    )))
 }
 
 /// Split text into sentences on sentence-ending punctuation followed by whitespace.
@@ -373,7 +385,7 @@ mod tests {
     fn all_named_voices_resolve_correctly() {
         for &(name, expected_id) in VOICE_MAP {
             assert_eq!(
-                resolve_voice_id(name),
+                resolve_voice_id(name).unwrap(),
                 expected_id,
                 "Voice '{name}' should resolve to {expected_id}"
             );
@@ -386,16 +398,28 @@ mod tests {
     }
 
     #[test]
-    fn unknown_voice_falls_back_to_numeric() {
-        assert_eq!(resolve_voice_id("5"), 5);
-        assert_eq!(resolve_voice_id("25"), 25);
-        assert_eq!(resolve_voice_id("0"), 0);
+    fn valid_numeric_voice_ids_resolve() {
+        assert_eq!(resolve_voice_id("5").unwrap(), 5);
+        assert_eq!(resolve_voice_id("25").unwrap(), 25);
+        assert_eq!(resolve_voice_id("0").unwrap(), 0);
     }
 
     #[test]
-    fn completely_unknown_voice_falls_back_to_zero() {
-        assert_eq!(resolve_voice_id("nonexistent_voice"), 0);
-        assert_eq!(resolve_voice_id(""), 0);
+    fn unknown_voice_is_rejected_and_named() {
+        let error = resolve_voice_id("nonexistent_voice")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nonexistent_voice"));
+        assert!(error.contains("af_heart"));
+    }
+
+    #[test]
+    fn out_of_range_numeric_voice_ids_are_rejected() {
+        for voice in ["-5", "26", "999"] {
+            let error = resolve_voice_id(voice).unwrap_err().to_string();
+            assert!(error.contains(voice));
+            assert!(error.contains("0..=25"));
+        }
     }
 
     #[test]

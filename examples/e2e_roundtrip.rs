@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tts.sample_rate()
     );
 
-    let sid = resolve_voice_id(&config.voice);
+    let sid = resolve_voice_id(&config.voice)?;
     let speed = config.speed;
 
     let mut total_edits = 0usize;
