@@ -272,7 +272,7 @@ fn stop_daemon_at(path: &std::path::Path) -> eyre::Result<()> {
         "Daemon (pid {}) did not stop within 5 seconds. Run `kill {}` to force it to stop. The PID file was kept so `vox daemon status` can still report it.",
         state.pid,
         state.pid
-    )
+    );
 }
 
 /// Tail the daemon log file for live viewing.
