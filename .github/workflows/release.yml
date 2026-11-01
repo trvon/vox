@@ -3,6 +3,13 @@ name: Release
 on:
   push:
     branches: [main]
+  # Rebuild a published tag's artifacts (for example after a runner image
+  # change) without cutting a new release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build release artifacts for (for example v0.3.0)
+        required: true
 
 permissions:
   contents: write
@@ -10,6 +17,7 @@ permissions:
 
 jobs:
   release-please:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
@@ -22,7 +30,7 @@ jobs:
 
   build:
     needs: release-please
-    if: needs.release-please.outputs.release_created
+    if: always() && (needs.release-please.outputs.release_created == 'true' || inputs.tag != '')
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +51,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       CARGO_INCREMENTAL: 0
+      # Set by release-please on main, or passed to a manual rebuild.
+      RELEASE_TAG: ${{ inputs.tag || needs.release-please.outputs.tag_name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,10 +83,21 @@ jobs:
       - name: Install cross-compilation tools (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
+          set -euo pipefail
+          # Host packages must stay amd64-only and arm64 must come from ports.
+          # Ubuntu 24.04+ runners use deb822 sources, where the old one-line
+          # sed on /etc/apt/sources.list matched nothing and apt then asked
+          # security.ubuntu.com for arm64 indexes it does not serve (404).
           sudo dpkg --add-architecture arm64
-          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i '/^Types:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          else
+            sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          fi
+          codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+          printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports\nSuites: %s %s-updates %s-backports %s-security\nComponents: main restricted universe multiverse\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+            "$codename" "$codename" "$codename" "$codename" \
+            | sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libasound2-dev:arm64
 
@@ -117,7 +138,7 @@ jobs:
       - name: Upload release artifact
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: ${{ matrix.name }}.tar.gz
 
   npm-publish:
