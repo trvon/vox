@@ -116,19 +116,37 @@ pub fn daemonize(port: Option<u16>) -> eyre::Result<()> {
 }
 
 /// Resolve the daemon log file path.
+///
+/// `VOX_LOG_FILE` wins when set, which is how the launchd plist and systemd
+/// unit stay in sync with whatever this function chooses instead of each
+/// guessing a directory. Otherwise the OS convention applies: macOS logs
+/// belong under `~/Library/Logs` (Console.app surfaces them), and XDG puts
+/// durable per-user state under `$XDG_STATE_HOME`, not `$XDG_DATA_HOME`.
 pub fn log_file_path() -> PathBuf {
-    let data_dir = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(xdg).join("vox")
-    } else {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| {
-                dirs::home_dir()
-                    .map(|h| h.join(".local").join("share"))
-                    .unwrap_or_else(|| PathBuf::from("."))
-            })
+    if let Some(explicit) = std::env::var_os("VOX_LOG_FILE")
+        && !explicit.is_empty()
+    {
+        return PathBuf::from(explicit);
+    }
+
+    if cfg!(target_os = "macos")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home
+            .join("Library")
+            .join("Logs")
             .join("vox")
-    };
-    data_dir.join("vox-daemon.log")
+            .join("vox-daemon.log");
+    }
+
+    let state_dir = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .map(|h| h.join(".local").join("state"))
+                .unwrap_or_else(|| PathBuf::from("."))
+        });
+    state_dir.join("vox").join("vox-daemon.log")
 }
 
 /// Resolve port from CLI arg > VOX_PORT env > default 3030.
@@ -281,6 +299,8 @@ pub fn daemon_status() -> i32 {
 mod tests {
     use super::*;
     use std::env;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
 
     #[test]
     fn daemon_state_parse_valid() {
