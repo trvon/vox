@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/trvon/vox/compare/v0.3.0...v0.3.1) (2026-11-01)
+
+
+### Bug Fixes
+
+* **release:** install arm64 packages from ports on deb822 runners ([#13](https://github.com/trvon/vox/issues/13)) ([919b692](https://github.com/trvon/vox/commit/919b6925c55f355ee27263aed1afa63a08256eeb))
+
 ## [0.3.0](https://github.com/trvon/vox/compare/v0.2.0...v0.3.0) (2026-11-01)
 
 
