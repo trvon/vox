@@ -236,3 +236,26 @@ fn display_all_includes_dsp_section() {
     assert!(output.contains("noise_gate_window = 512"));
     assert!(output.contains("normalize_threshold = 0.5"));
 }
+
+#[test]
+fn config_get_escapes_user_controlled_paths_as_toml() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A quote in the path would break hand-formatted TOML.
+    let odd = tmp.path().join("logs/we\"ird\\dir/daemon.log");
+    let output = Command::new(env!("CARGO_BIN_EXE_vox"))
+        .args(["config", "get"])
+        .env("XDG_CONFIG_HOME", tmp.path().join("config"))
+        .env("XDG_DATA_HOME", tmp.path().join("data"))
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .env("XDG_RUNTIME_DIR", tmp.path().join("runtime"))
+        .env("VOX_LOG_FILE", &odd)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let value: toml::Value = toml::from_str(&stdout).expect("resolved paths must be valid TOML");
+    assert_eq!(
+        value["paths"]["log_file"].as_str().unwrap(),
+        odd.to_str().unwrap()
+    );
+}

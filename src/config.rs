@@ -234,6 +234,21 @@ fn config_path() -> PathBuf {
         .join("config.toml")
 }
 
+/// Keys `vox config set` accepts and `vox config get` reports.
+pub const CONFIG_KEYS: &[&str] = &[
+    "voice",
+    "speed",
+    "model_dir",
+    "recordings_dir",
+    "kokoro_model",
+    "stt_model",
+    "log_level",
+    "dsp.hpf_cutoff_hz",
+    "dsp.noise_gate_rms",
+    "dsp.noise_gate_window",
+    "dsp.normalize_threshold",
+];
+
 impl Config {
     /// Wrap this config in a SharedConfig (Arc<RwLock<Config>>).
     pub fn into_shared(self) -> SharedConfig {
@@ -437,7 +452,8 @@ impl Config {
             }
             _ => {
                 return Err(format!(
-                    "Unknown config key: {key}\nValid keys: voice, speed, model_dir, recordings_dir, kokoro_model, stt_model, log_level, dsp.hpf_cutoff_hz, dsp.noise_gate_rms, dsp.noise_gate_window, dsp.normalize_threshold"
+                    "Unknown config key: {key}\nValid keys: {}",
+                    CONFIG_KEYS.join(", ")
                 ));
             }
         }

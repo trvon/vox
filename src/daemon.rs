@@ -116,19 +116,37 @@ pub fn daemonize(port: Option<u16>) -> eyre::Result<()> {
 }
 
 /// Resolve the daemon log file path.
+///
+/// `VOX_LOG_FILE` wins when set, which is how the launchd plist and systemd
+/// unit stay in sync with whatever this function chooses instead of each
+/// guessing a directory. Otherwise the OS convention applies: macOS logs
+/// belong under `~/Library/Logs` (Console.app surfaces them), and XDG puts
+/// durable per-user state under `$XDG_STATE_HOME`, not `$XDG_DATA_HOME`.
 pub fn log_file_path() -> PathBuf {
-    let data_dir = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(xdg).join("vox")
-    } else {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| {
-                dirs::home_dir()
-                    .map(|h| h.join(".local").join("share"))
-                    .unwrap_or_else(|| PathBuf::from("."))
-            })
+    if let Some(explicit) = std::env::var_os("VOX_LOG_FILE")
+        && !explicit.is_empty()
+    {
+        return PathBuf::from(explicit);
+    }
+
+    if cfg!(target_os = "macos")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home
+            .join("Library")
+            .join("Logs")
             .join("vox")
-    };
-    data_dir.join("vox-daemon.log")
+            .join("vox-daemon.log");
+    }
+
+    let state_dir = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .map(|h| h.join(".local").join("state"))
+                .unwrap_or_else(|| PathBuf::from("."))
+        });
+    state_dir.join("vox").join("vox-daemon.log")
 }
 
 /// Resolve port from CLI arg > VOX_PORT env > default 3030.
@@ -207,6 +225,20 @@ pub fn stop_daemon() -> eyre::Result<()> {
     stop_daemon_at(&pid_file_path())
 }
 
+/// Stop the tracked daemon if there is one.
+///
+/// A missing PID file means nothing to stop, which is not an error for callers
+/// like `daemon restart`. A stop that times out *is* an error, so the caller can
+/// abort instead of starting a second daemon beside the surviving one.
+pub fn stop_daemon_if_running() -> eyre::Result<()> {
+    let path = pid_file_path();
+    if path.exists() {
+        stop_daemon_at(&path)
+    } else {
+        Ok(())
+    }
+}
+
 /// Stop the daemon described by `path`, which lets tests use a private PID file
 /// instead of mutating `XDG_RUNTIME_DIR` while other tests run in parallel.
 fn stop_daemon_at(path: &std::path::Path) -> eyre::Result<()> {
@@ -240,7 +272,7 @@ fn stop_daemon_at(path: &std::path::Path) -> eyre::Result<()> {
         "Daemon (pid {}) did not stop within 5 seconds. Run `kill {}` to force it to stop. The PID file was kept so `vox daemon status` can still report it.",
         state.pid,
         state.pid
-    )
+    );
 }
 
 /// Tail the daemon log file for live viewing.
@@ -281,6 +313,8 @@ pub fn daemon_status() -> i32 {
 mod tests {
     use super::*;
     use std::env;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
 
     #[test]
     fn daemon_state_parse_valid() {

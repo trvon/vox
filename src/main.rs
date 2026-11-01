@@ -59,15 +59,31 @@ impl ResolvedPaths {
     }
 
     fn display(&self) -> String {
-        format!(
-            "[paths]\nconfig_file = \"{}\"\nmodel_dir = \"{}\"\nrecordings_dir = \"{}\"\nlog_file = \"{}\"\npid_file = \"{}\"\n\n[daemon]\nport = {}",
-            self.config_file.display(),
-            self.model_dir.display(),
-            self.recordings_dir.display(),
-            self.log_file.display(),
-            self.pid_file.display(),
-            self.port,
-        )
+        // Serialize rather than format: paths are user-controlled (XDG_*,
+        // VOX_LOG_FILE) and may contain quotes, backslashes, or newlines.
+        let mut paths = toml::Table::new();
+        for (key, value) in [
+            ("config_file", &self.config_file),
+            ("model_dir", &self.model_dir),
+            ("recordings_dir", &self.recordings_dir),
+            ("log_file", &self.log_file),
+            ("pid_file", &self.pid_file),
+        ] {
+            paths.insert(
+                key.to_string(),
+                toml::Value::String(value.display().to_string()),
+            );
+        }
+        let mut daemon = toml::Table::new();
+        daemon.insert(
+            "port".to_string(),
+            toml::Value::Integer(i64::from(self.port)),
+        );
+
+        let mut root = toml::Table::new();
+        root.insert("paths".to_string(), toml::Value::Table(paths));
+        root.insert("daemon".to_string(), toml::Value::Table(daemon));
+        toml::to_string(&root).expect("string tables serialize")
     }
 }
 
@@ -91,14 +107,15 @@ fn main() -> eyre::Result<()> {
     }) = &cli.command
         && !foreground
     {
-        // For restart, stop the old daemon first
+        // For restart, stop the old daemon first. A stop that times out is an
+        // error: starting now would leave two daemons owning one PID file.
         if matches!(
             &cli.command,
             Some(Command::Daemon {
                 action: DaemonAction::Restart { .. }
             })
         ) {
-            let _ = daemon::stop_daemon();
+            daemon::stop_daemon_if_running()?;
         }
         daemon::daemonize(*port)?;
         return Ok(());
@@ -136,7 +153,8 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
                         Some(val) => println!("{val}"),
                         None => {
                             eprintln!(
-                                "Unknown key: {key}\nValid config keys: voice, speed, model_dir, recordings_dir, kokoro_model, stt_model, log_level, dsp.hpf_cutoff_hz, dsp.noise_gate_rms, dsp.noise_gate_window, dsp.normalize_threshold\nValid derived keys: config_file, log_file, pid_file, port"
+                                "Unknown key: {key}\nConfig keys: {}\nDerived keys: config_file, model_dir, recordings_dir, log_file, pid_file, port",
+                                config::CONFIG_KEYS.join(", ")
                             );
                             std::process::exit(1);
                         }
@@ -237,8 +255,8 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
                 daemon::start(tts, stt, config, port).await?;
             }
             DaemonAction::Restart { port, .. } => {
-                // Stop if running (ignore errors if not running)
-                let _ = daemon::stop_daemon();
+                // Aborts when the old daemon survives SIGTERM; nothing to stop is fine.
+                daemon::stop_daemon_if_running()?;
                 let port = daemon::resolve_port(port);
                 ensure_models(&config).await?;
                 let (tts, stt) = init_engines(&config).await?;
