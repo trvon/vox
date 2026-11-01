@@ -198,7 +198,12 @@ vox daemon restart             # stop + start
 vox daemon log                 # tail the daemon log
 ```
 
+Resolved locations are reported by `vox config get`; for example,
+`vox config get log_file` prints the file tailed by `vox daemon log`.
+
 Point clients at the daemon:
+
+> **Security:** The daemon binds to loopback and has no token authentication. Its tools can drive the microphone and speakers. Never expose or proxy port 3030 (or the configured daemon port) to another host.
 
 ```json
 {
@@ -286,20 +291,31 @@ Settings are resolved in order: compiled defaults, then TOML file, then env vars
 | `VOX_SPEED` | `speed` | `1.4` | Speech rate multiplier |
 | `VOX_MODEL_DIR` | `model_dir` | `$XDG_DATA_HOME/vox/models` | Model storage path |
 | `VOX_KOKORO_MODEL` | `kokoro_model` | `int8-v1_1` | Kokoro model variant (`int8-v1_1` or `fp32-v1_1`) |
+| `VOX_STT_MODEL` | `stt_model` | `moonshine-base` | STT model variant |
+| `VOX_RECORDINGS_DIR` | `recordings_dir` | `$XDG_DATA_HOME/vox/recordings` | Recording and transcript storage |
 | `VOX_LOG_LEVEL` | `log_level` | `info` | Log filter |
+| `VOX_TTS_THREADS` | `tts_num_threads` | `2` | TTS inference threads |
+| `VOX_STT_THREADS` | — | `1` | STT inference threads (env only) |
+| `VOX_DSP_HPF_CUTOFF_HZ` | `dsp.hpf_cutoff_hz` | `200.0` | High-pass filter cutoff |
+| `VOX_DSP_NOISE_GATE_RMS` | `dsp.noise_gate_rms` | `0.01` | Noise gate RMS threshold |
+| `VOX_DSP_NOISE_GATE_WINDOW` | `dsp.noise_gate_window` | `512` | Noise gate window size |
+| `VOX_DSP_NORMALIZE_THRESHOLD` | `dsp.normalize_threshold` | `0.5` | Peak-normalization threshold |
 | `VOX_PORT` | — | `3030` | Daemon mode port (env/CLI only) |
+| `VOX_LOG_FILE` | — | platform log directory | Daemon log path (env only) |
 
 TOML config location: `$XDG_CONFIG_HOME/vox/config.toml` (e.g. `~/.config/vox/config.toml`).
 
 Manage config from the CLI:
 
 ```bash
-vox config get            # show all values
-vox config get voice      # show a single value
+vox config get                  # show effective settings and resolved [paths]
+vox config get voice            # show one setting
+vox config get log_file         # show one resolved path
+vox config get pid_file         # derived keys also include config_file and port
 vox config set kokoro_model fp32-v1_1
-vox config set speed 1.5  # persist to config.toml
-vox config path           # print config file location
-vox config reset-dsp      # reset DSP parameters to defaults
+vox config set speed 1.5        # persist to config.toml
+vox config path                 # alias for: vox config get config_file
+vox config reset-dsp            # reset DSP parameters to defaults
 ```
 
 <details>

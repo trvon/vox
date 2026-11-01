@@ -1,7 +1,7 @@
 ---
 name: vox
 description: Lightweight voice MCP server with local Moonshine STT + Kokoro TTS
-version: 0.1.0
+version: 0.2.0
 tags: [mcp, voice, tts, stt, rust]
 ---
 
@@ -50,11 +50,11 @@ All of `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` must
 ## Config System
 
 Precedence (highest wins):
-1. Environment variables: `VOX_SPEED`, `VOX_VOICE`, `VOX_MODEL_DIR`, `VOX_LOG_LEVEL`, `VOX_PORT`
+1. Environment variables: `VOX_MODEL_DIR`, `VOX_KOKORO_MODEL`, `VOX_STT_MODEL`, `VOX_RECORDINGS_DIR`, `VOX_VOICE`, `VOX_SPEED`, `VOX_LOG_LEVEL`, `VOX_TTS_THREADS`, `VOX_STT_THREADS`, `VOX_DSP_HPF_CUTOFF_HZ`, `VOX_DSP_NOISE_GATE_RMS`, `VOX_DSP_NOISE_GATE_WINDOW`, `VOX_DSP_NORMALIZE_THRESHOLD`, plus daemon-only `VOX_PORT` and log-file override `VOX_LOG_FILE`
 2. TOML file: `$XDG_CONFIG_HOME/vox/config.toml`
 3. Compiled defaults (`Config::default()`)
 
-CLI management: `vox config get [key]`, `vox config set <key> <value>`, `vox config path`
+CLI management: `vox config get [key]`, `vox config set <key> <value>`, `vox config path`. Resolved locations (config, models, recordings, daemon log/PID, and port) come from `vox config get`; `vox config path` remains an alias for `vox config get config_file`. `vox daemon` is lifecycle-only except `daemon log`, which tails the resolved log file.
 
 ## MCP Tools
 

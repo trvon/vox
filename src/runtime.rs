@@ -351,7 +351,8 @@ impl VoiceRuntime {
 
         let producer = tokio::task::spawn_blocking(move || {
             let mut tts = tts.lock().map_err(|e| format!("TTS lock: {e}"))?;
-            let sid = crate::tts::resolve_voice_id(&selected_voice);
+            let sid = crate::tts::resolve_voice_id(&selected_voice)
+                .map_err(|e| format!("TTS failed: {e}"))?;
 
             if use_sentence_streaming {
                 tracing::debug!("Using sentence-first streaming for low latency");

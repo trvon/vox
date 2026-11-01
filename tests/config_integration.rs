@@ -1,4 +1,62 @@
+use std::process::Command;
 use vox::config::{Config, SharedConfig};
+
+fn isolated_vox(tmp: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_vox"))
+        .args(args)
+        .env("XDG_CONFIG_HOME", tmp.path().join("config"))
+        .env("XDG_DATA_HOME", tmp.path().join("data"))
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .env("XDG_RUNTIME_DIR", tmp.path().join("runtime"))
+        .env("VOX_LOG_FILE", tmp.path().join("logs/daemon.log"))
+        .env("VOX_PORT", "43123")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn config_get_reports_isolated_resolved_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = isolated_vox(&tmp, &["config", "get"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let value: toml::Value = toml::from_str(&stdout).unwrap();
+    let paths = value.get("paths").and_then(toml::Value::as_table).unwrap();
+
+    assert_eq!(
+        paths["config_file"].as_str().unwrap(),
+        tmp.path().join("config/vox/config.toml").to_str().unwrap()
+    );
+    assert_eq!(
+        paths["model_dir"].as_str().unwrap(),
+        tmp.path().join("data/vox/models").to_str().unwrap()
+    );
+    assert_eq!(
+        paths["recordings_dir"].as_str().unwrap(),
+        tmp.path().join("data/vox/recordings").to_str().unwrap()
+    );
+    assert_eq!(
+        paths["log_file"].as_str().unwrap(),
+        tmp.path().join("logs/daemon.log").to_str().unwrap()
+    );
+    assert_eq!(
+        paths["pid_file"].as_str().unwrap(),
+        tmp.path().join("runtime/vox.pid").to_str().unwrap()
+    );
+    let daemon = value.get("daemon").and_then(toml::Value::as_table).unwrap();
+    assert_eq!(daemon["port"].as_integer(), Some(43123));
+}
+
+#[test]
+fn config_get_log_file_matches_resolved_log_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = isolated_vox(&tmp, &["config", "get", "log_file"]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        tmp.path().join("logs/daemon.log").to_str().unwrap()
+    );
+}
 
 #[test]
 fn config_roundtrip_with_dsp() {

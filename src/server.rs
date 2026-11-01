@@ -88,7 +88,7 @@ pub struct TtsQueueClearParams {}
 /// MCP tool parameters for the `listen` tool
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ListenParams {
-    #[schemars(description = "Silence duration in ms before end-of-turn (default: 1000)")]
+    #[schemars(description = "Silence duration in ms before end-of-turn (default: 1500)")]
     #[serde(default = "default_silence_timeout")]
     pub silence_timeout_ms: u32,
 
@@ -703,7 +703,7 @@ impl VoiceMcpServer {
 
     #[tool(
         name = "calibrate",
-        description = "Run DSP calibration using a genetic algorithm on live audio. Requires the user to read a passage aloud and record silence. Returns optimal DSP parameters. Set dry_run=false to persist results to config."
+        description = "Run DSP calibration using a genetic algorithm on live audio. Requires the user to read a passage aloud and record silence. Returns optimal DSP parameters. Defaults to a preview that does not save; set dry_run=false to persist results to config."
     )]
     async fn calibrate(
         &self,

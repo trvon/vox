@@ -71,6 +71,12 @@ elif [[ "${OS}" == "Darwin" ]]; then
     info "Installing launchd plist → ${PLIST_PATH}"
     mkdir -p "${PLIST_DIR}" "${DATA_DIR}"
 
+    # Ask the binary where the log goes, so the plist cannot drift from
+    # daemon::log_file_path() the way a hardcoded path did.
+    LOG_PATH="$("${INSTALL_DIR}/vox" config get log_file 2>/dev/null || true)"
+    [[ -n "${LOG_PATH}" ]] || LOG_PATH="${DATA_DIR}/vox-daemon.log"
+    mkdir -p "$(dirname "${LOG_PATH}")"
+
     # Unload existing plist if loaded
     launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || true
 
@@ -94,7 +100,7 @@ elif [[ "${OS}" == "Darwin" ]]; then
     <key>KeepAlive</key>
     <true/>
     <key>StandardErrorPath</key>
-    <string>${DATA_DIR}/vox-daemon.log</string>
+    <string>${LOG_PATH}</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>DYLD_LIBRARY_PATH</key>
@@ -112,7 +118,7 @@ PLIST
     if command -v curl >/dev/null 2>&1 && curl -sf "http://localhost:${DAEMON_PORT}/mcp" -o /dev/null 2>/dev/null; then
         info "Daemon is running on http://localhost:${DAEMON_PORT}/mcp"
     else
-        info "Daemon loaded (check ${DATA_DIR}/vox-daemon.log if it fails to start)"
+        info "Daemon loaded (check ${LOG_PATH} if it fails to start)"
     fi
 fi
 
