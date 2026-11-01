@@ -198,6 +198,9 @@ vox daemon restart             # stop + start
 vox daemon log                 # tail the daemon log
 ```
 
+Resolved locations are reported by `vox config get`; for example,
+`vox config get log_file` prints the file tailed by `vox daemon log`.
+
 Point clients at the daemon:
 
 > **Security:** The daemon binds to loopback and has no token authentication. Its tools can drive the microphone and speakers. Never expose or proxy port 3030 (or the configured daemon port) to another host.
@@ -305,12 +308,14 @@ TOML config location: `$XDG_CONFIG_HOME/vox/config.toml` (e.g. `~/.config/vox/co
 Manage config from the CLI:
 
 ```bash
-vox config get            # show all values
-vox config get voice      # show a single value
+vox config get                  # show effective settings and resolved [paths]
+vox config get voice            # show one setting
+vox config get log_file         # show one resolved path
+vox config get pid_file         # derived keys also include config_file and port
 vox config set kokoro_model fp32-v1_1
-vox config set speed 1.5  # persist to config.toml
-vox config path           # print config file location
-vox config reset-dsp      # reset DSP parameters to defaults
+vox config set speed 1.5        # persist to config.toml
+vox config path                 # alias for: vox config get config_file
+vox config reset-dsp            # reset DSP parameters to defaults
 ```
 
 <details>

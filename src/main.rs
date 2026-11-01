@@ -22,6 +22,63 @@ use clap::Parser;
 use cli::{Cli, Command, ConfigAction, DaemonAction, ServiceAction, ToolAction};
 use config::Config;
 use rmcp::ServiceExt;
+use std::path::{Path, PathBuf};
+
+struct ResolvedPaths {
+    config_file: PathBuf,
+    model_dir: PathBuf,
+    recordings_dir: PathBuf,
+    log_file: PathBuf,
+    pid_file: PathBuf,
+    port: u16,
+}
+
+impl ResolvedPaths {
+    fn new(config: &Config) -> eyre::Result<Self> {
+        Ok(Self {
+            config_file: absolute_path(Config::config_path())?,
+            model_dir: absolute_path(&config.model_dir)?,
+            recordings_dir: absolute_path(config.recordings_dir())?,
+            log_file: absolute_path(daemon::log_file_path())?,
+            pid_file: absolute_path(daemon::pid_file_path())?,
+            port: daemon::resolve_port(None),
+        })
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        let value = match key {
+            "config_file" => self.config_file.display().to_string(),
+            "model_dir" => self.model_dir.display().to_string(),
+            "recordings_dir" => self.recordings_dir.display().to_string(),
+            "log_file" => self.log_file.display().to_string(),
+            "pid_file" => self.pid_file.display().to_string(),
+            "port" => self.port.to_string(),
+            _ => return None,
+        };
+        Some(value)
+    }
+
+    fn display(&self) -> String {
+        format!(
+            "[paths]\nconfig_file = \"{}\"\nmodel_dir = \"{}\"\nrecordings_dir = \"{}\"\nlog_file = \"{}\"\npid_file = \"{}\"\n\n[daemon]\nport = {}",
+            self.config_file.display(),
+            self.model_dir.display(),
+            self.recordings_dir.display(),
+            self.log_file.display(),
+            self.pid_file.display(),
+            self.port,
+        )
+    }
+}
+
+fn absolute_path(path: impl AsRef<Path>) -> eyre::Result<PathBuf> {
+    let path = path.as_ref();
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
 
 fn main() -> eyre::Result<()> {
     // Parse CLI first so --help/--version exit immediately
@@ -72,18 +129,21 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
             ServiceAction::Uninstall => service::uninstall()?,
         },
         Some(Command::Config { action }) => {
+            let paths = ResolvedPaths::new(&config)?;
             match action {
-                ConfigAction::Get { key: Some(key) } => match config.get_value(&key) {
-                    Some(val) => println!("{val}"),
-                    None => {
-                        eprintln!(
-                            "Unknown key: {key}\nValid keys: voice, speed, model_dir, kokoro_model, log_level"
-                        );
-                        std::process::exit(1);
+                ConfigAction::Get { key: Some(key) } => {
+                    match paths.get(&key).or_else(|| config.get_value(&key)) {
+                        Some(val) => println!("{val}"),
+                        None => {
+                            eprintln!(
+                                "Unknown key: {key}\nValid derived keys: config_file, model_dir, recordings_dir, log_file, pid_file, port"
+                            );
+                            std::process::exit(1);
+                        }
                     }
-                },
+                }
                 ConfigAction::Get { key: None } => {
-                    println!("{}", config.display_all());
+                    println!("{}\n\n{}", config.display_all(), paths.display());
                 }
                 ConfigAction::Set { key, value } => {
                     Config::set_value(&key, &value).map_err(|e| eyre::eyre!("{e}"))?;
@@ -94,7 +154,7 @@ async fn async_main(cli: Cli) -> eyre::Result<()> {
                     }
                 }
                 ConfigAction::Path => {
-                    println!("{}", Config::config_path().display());
+                    println!("{}", paths.get("config_file").expect("derived key exists"));
                 }
                 ConfigAction::ResetDsp => {
                     Config::reset_dsp().map_err(|e| eyre::eyre!("{e}"))?;

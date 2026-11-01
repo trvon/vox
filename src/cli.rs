@@ -253,8 +253,7 @@ pub enum ToolAction {
 pub enum ConfigAction {
     /// Show a config value (or all values if no key given)
     Get {
-        /// Config key: voice, speed, model_dir, recordings_dir, kokoro_model,
-        /// stt_model, log_level, or a dsp.* key
+        /// Config or derived key (for example: voice, config_file, log_file, pid_file, port)
         key: Option<String>,
     },
     /// Set a config value
