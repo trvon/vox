@@ -204,13 +204,18 @@ pub async fn start(tts: TtsEngine, stt: SttEngine, config: Config, port: u16) ->
 
 /// Stop a running daemon by sending SIGTERM.
 pub fn stop_daemon() -> eyre::Result<()> {
-    let path = pid_file_path();
-    let contents = fs::read_to_string(&path)
+    stop_daemon_at(&pid_file_path())
+}
+
+/// Stop the daemon described by `path`, which lets tests use a private PID file
+/// instead of mutating `XDG_RUNTIME_DIR` while other tests run in parallel.
+fn stop_daemon_at(path: &std::path::Path) -> eyre::Result<()> {
+    let contents = fs::read_to_string(path)
         .map_err(|_| eyre::eyre!("No PID file found — daemon is not running"))?;
     let state = DaemonState::parse(&contents).ok_or_else(|| eyre::eyre!("Corrupt PID file"))?;
 
     if !state.is_running() {
-        remove_pid_file();
+        let _ = fs::remove_file(path);
         eprintln!("Daemon is not running (stale PID file cleaned up)");
         return Ok(());
     }
@@ -225,15 +230,17 @@ pub fn stop_daemon() -> eyre::Result<()> {
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if !state.is_running() {
-            remove_pid_file();
+            let _ = fs::remove_file(path);
             eprintln!("Daemon stopped");
             return Ok(());
         }
     }
 
-    eprintln!("Daemon did not stop within 5 seconds");
-    remove_pid_file();
-    Ok(())
+    eyre::bail!(
+        "Daemon (pid {}) did not stop within 5 seconds. Run `kill {}` to force it to stop. The PID file was kept so `vox daemon status` can still report it.",
+        state.pid,
+        state.pid
+    )
 }
 
 /// Tail the daemon log file for live viewing.
@@ -374,6 +381,43 @@ mod tests {
             port: 3030,
         };
         assert!(!state.is_running());
+    }
+
+    #[test]
+    fn stop_keeps_pid_file_when_process_ignores_sigterm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; echo ready; sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+
+        // A private path keeps this test off the real daemon's PID file even
+        // when tests run in parallel.
+        let pid_path = tmp.path().join("vox.pid");
+        fs::write(&pid_path, DaemonState { pid, port: 3030 }.serialize()).unwrap();
+
+        let error = stop_daemon_at(&pid_path).unwrap_err().to_string();
+        assert!(error.contains(&pid.to_string()));
+        assert!(error.contains(&format!("kill {pid}")));
+        assert_eq!(
+            fs::read_to_string(&pid_path).unwrap(),
+            format!("{pid}:3030")
+        );
+
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        child.wait().unwrap();
+        fs::remove_file(pid_path).unwrap();
     }
 
     #[test]
